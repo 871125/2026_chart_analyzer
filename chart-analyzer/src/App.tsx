@@ -7,7 +7,7 @@ import { Activity, TrendingUp, TrendingDown, AlertCircle, RefreshCw, Box as BoxI
 
 export type CandleInterval = '4h' | '1d';
 export type ZoneType = 'order_block' | 'volume_zone' | 'sideways_box';
-export type StrategyStatus = 'active' | 'reacted' | 'invalidated';
+export type StrategyStatus = 'active' | 'reacted' | 'invalidated' | 'canceled';
 
 export interface Candle {
     openTime: number;
@@ -62,8 +62,10 @@ export interface Box extends Zone {
     isEntered?: boolean;        
     enteredAt?: number;         
     assetRoiPercent?: number;   
-    positionSize?: number;      // 진입 수량(달러 가치)
-    riskAmount?: number;        // 리스크 금액($)
+    positionSize?: number;      
+    riskAmount?: number;        
+    marginUsed?: number;        // 포지션 유지에 사용된 증거금
+    skipReason?: 'max_positions' | 'no_margin' | 'sl_before_ep'; // 진입 취소 사유
 }
 
 class BinanceAPI {
@@ -149,7 +151,7 @@ class BinanceAPI {
         candles.push({ openTime: time, closeTime: time + 1000, open: 114, close: 115, low: 104, high: 116, isBullish: true, volume: 1000 }); time += 4 * 60 * 60 * 1000;
         candles.push({ openTime: time, closeTime: time + 1000, open: 115, close: 116, low: 105, high: 117, isBullish: true, volume: 1000 }); time += 4 * 60 * 60 * 1000;
 
-        for (let i = 0; i < 50; i++) {
+        for (let i = 0; i < 100; i++) {
             candles.push({ openTime: time, closeTime: time + 1000, open: 116 + i, close: 117 + i, high: 118 + i, low: 115 + i, isBullish: true, volume: 1000 });
             time += 4 * 60 * 60 * 1000;
         }
@@ -183,14 +185,12 @@ class Indicators {
 
     static hasRegularDivergence(candles: Candle[], rsi: number[], index: number, isBullishBreakout: boolean): boolean {
         if (index < 10) return false;
-        
         const isPivotLow = (idx: number) => {
             if (idx < 3 || idx > candles.length - 4) return false;
             const l = candles[idx].low;
             return l <= candles[idx-1].low && l <= candles[idx-2].low && l <= candles[idx-3].low &&
                    l <= candles[idx+1].low && l <= candles[idx+2].low && l <= candles[idx+3].low;
         };
-
         const isPivotHigh = (idx: number) => {
             if (idx < 3 || idx > candles.length - 4) return false;
             const h = candles[idx].high;
@@ -337,9 +337,7 @@ class ChartEngine {
 
     public process(candles: Candle[], interval: CandleInterval, rrRatio: number): Box[] {
         let boxes = this.detector.detect(candles, interval, rrRatio);
-        boxes = this.dedupe(boxes);
-        this.updateLifecycle(boxes, candles);
-        return boxes;
+        return this.dedupe(boxes); // 생명주기 관리(updateLifecycle)는 UI 단의 시계열 루프로 완전히 이관됨
     }
 
     private dedupe(boxes: Box[]): Box[] {
@@ -358,38 +356,7 @@ class ChartEngine {
         }
         return filtered;
     }
-
-    private updateLifecycle(boxes: Box[], candles: Candle[]) {
-        for (const box of boxes) {
-            if (box.status !== 'active') continue;
-            for (let i = box.createdIndex + 1; i < candles.length; i++) {
-                const c = candles[i];
-                if (!box.touchedAt && c.low <= box.high && c.high >= box.low) box.touchedAt = c.openTime;
-
-                if (box.direction === 'long') {
-                    if (!box.isEntered && c.low <= box.ep) {
-                        box.isEntered = true; 
-                        box.enteredAt = c.openTime;
-                    }
-                    if (box.isEntered) {
-                        if (c.low <= box.sl) { box.status = 'invalidated'; box.resolvedAt = c.openTime; break; }
-                        if (c.high >= box.tp) { box.status = 'reacted'; box.resolvedAt = c.openTime; break; }
-                    }
-                } else {
-                    if (!box.isEntered && c.high >= box.ep) {
-                        box.isEntered = true;
-                        box.enteredAt = c.openTime;
-                    }
-                    if (box.isEntered) {
-                        if (c.high >= box.sl) { box.status = 'invalidated'; box.resolvedAt = c.openTime; break; }
-                        if (c.low <= box.tp) { box.status = 'reacted'; box.resolvedAt = c.openTime; break; }
-                    }
-                }
-            }
-        }
-    }
 }
-
 
 // ==========================================
 // 2. 리액트 뷰 (UI 컴포넌트)
@@ -400,8 +367,11 @@ export default function App() {
     const [interval, setInterval] = useState<CandleInterval>('4h');
     const [rrRatio, setRrRatio] = useState<number>(2.0); 
     
+    // 트레이딩 설정 상태
     const [initialCapital, setInitialCapital] = useState<number>(10000);
     const [riskPerTrade, setRiskPerTrade] = useState<number>(1.0); 
+    const [leverage, setLeverage] = useState<number>(10); // 기본 10배 레버리지
+    const [maxPositions, setMaxPositions] = useState<number>(3); // 동시 유지 최대 포지션 수
     
     const [startDate, setStartDate] = useState(() => {
         const d = new Date();
@@ -416,7 +386,6 @@ export default function App() {
     const [loading, setLoading] = useState(false);
     const [isMockData, setIsMockData] = useState(false);
     
-    // 승률, MDD 통계 상태
     const [tradeStats, setTradeStats] = useState({ winRate: 0, mdd: 0, wins: 0, total: 0 });
     
     const [viewState, setViewState] = useState({ offset: 0, count: 200 });
@@ -444,78 +413,179 @@ export default function App() {
         setLoading(false);
     };
 
-    // [중요 로직 업데이트] 복리 PNL 자산 기준점 스냅샷 및 통계 지표 구현
+    // [핵심] 시계열 기반 백테스트 시뮬레이터 (다중 포지션 및 마진 추적)
     useEffect(() => {
         if (rawCandles.length === 0) return;
         const engine = new ChartEngine();
         const detectedBoxes = engine.process(rawCandles, interval, rrRatio);
         
-        let currentPnl = 0;
         let currentEquity = initialCapital;
-        const entryEquityMap = new Map<string, number>(); // 진입 시점 자산 스냅샷 보관
-
+        let availableMargin = initialCapital;
+        let totalR = 0;
+        
         let peakEquity = initialCapital;
         let maxDrawdown = 0;
 
+        const openPositions: Box[] = [];
+        const pendingBoxes: Box[] = [...detectedBoxes];
+        const finalBoxes: Box[] = []; // 처리가 끝난(청산/취소) 박스들을 모아두는 배열
+
         const curve = rawCandles.map(c => {
-            // [1] 진입 시점에 해당 시점의 최신 자본금 스냅샷을 캡처하여 저장합니다.
-            const enteredHere = detectedBoxes.filter(b => b.enteredAt === c.openTime);
-            enteredHere.forEach(b => {
-                entryEquityMap.set(b.id, currentEquity);
+            
+            // 1. 현재 오픈된 포지션 청산 여부(SL/TP 도달) 확인
+            for (let i = openPositions.length - 1; i >= 0; i--) {
+                const pos = openPositions[i];
+                let isResolved = false;
+                let isWin = false;
+
+                if (pos.direction === 'long') {
+                    if (c.low <= pos.sl) { isResolved = true; isWin = false; }
+                    else if (c.high >= pos.tp) { isResolved = true; isWin = true; }
+                } else {
+                    if (c.high >= pos.sl) { isResolved = true; isWin = false; }
+                    else if (c.low <= pos.tp) { isResolved = true; isWin = true; }
+                }
+
+                if (isResolved) {
+                    const pnl = isWin ? (pos.riskAmount! * rrRatio) : -pos.riskAmount!;
+                    currentEquity += pnl;
+                    availableMargin += pos.marginUsed! + pnl; // 사용한 증거금 환원 + 손익 정산
+                    totalR += isWin ? rrRatio : -1;
+                    
+                    pos.status = isWin ? 'reacted' : 'invalidated';
+                    pos.resolvedAt = c.openTime;
+                    pos.realizedPnl = pnl;
+                    pos.realizedPnlPercent = (pnl / (currentEquity - pnl)) * 100;
+                    pos.assetRoiPercent = isWin 
+                        ? (pos.direction === 'long' ? ((pos.tp - pos.ep) / pos.ep) * 100 : ((pos.ep - pos.tp) / pos.ep) * 100)
+                        : (pos.direction === 'long' ? ((pos.sl - pos.ep) / pos.ep) * 100 : ((pos.ep - pos.sl) / pos.ep) * 100);
+                    
+                    finalBoxes.push(pos);
+                    openPositions.splice(i, 1);
+                }
+            }
+
+            // 2. 대기 중인(Pending) 박스 중, 진입가(EP)에 오기 전에 손절가(SL)를 먼저 쳐버린 타점 취소
+            for (let i = pendingBoxes.length - 1; i >= 0; i--) {
+                const box = pendingBoxes[i];
+                if (c.openTime < box.createdAt) continue; 
                 
-                // 진입 시점의 리스크 및 진입 수량(Position Size) 계산
-                const riskAmount = currentEquity * (riskPerTrade / 100);
-                const stopLossPercent = Math.max(Math.abs(b.ep - b.sl) / b.ep, 0.0001); // 0 나누기 방지
-                b.riskAmount = riskAmount;
-                b.positionSize = riskAmount / stopLossPercent; // 리스크 금액을 S/L 비율로 나누어 실제 투입 자본 계산
-            });
+                let hitSlBeforeEntry = false;
+                if (box.direction === 'long' && c.low <= box.sl) hitSlBeforeEntry = true;
+                if (box.direction === 'short' && c.high >= box.sl) hitSlBeforeEntry = true;
 
-            // [2] 청산 시점 계산: 진입했을 때 저장했던 자산을 바탕으로 리스크를 계산합니다.
-            const resolvedHere = detectedBoxes.filter(b => b.resolvedAt === c.openTime);
-            resolvedHere.forEach(b => {
-                // 스냅샷이 없으면 에러방지용으로 최신 자산 사용 (안전 장치)
-                const equityAtEntry = entryEquityMap.get(b.id) || currentEquity;
-                const riskAmount = equityAtEntry * (riskPerTrade / 100);
-
-                if (b.status === 'reacted') {
-                    currentPnl += rrRatio;
-                    b.realizedPnl = riskAmount * rrRatio;
-                    // 진입 시점 자산 대비 계좌 수익률 계산
-                    b.realizedPnlPercent = (b.realizedPnl / equityAtEntry) * 100;
-                    b.assetRoiPercent = b.direction === 'long' ? ((b.tp - b.ep) / b.ep) * 100 : ((b.ep - b.tp) / b.ep) * 100;
-                    currentEquity += b.realizedPnl;
+                if (hitSlBeforeEntry) {
+                    box.status = 'canceled';
+                    box.skipReason = 'sl_before_ep';
+                    box.resolvedAt = c.openTime;
+                    finalBoxes.push(box);
+                    pendingBoxes.splice(i, 1);
                 }
-                else if (b.status === 'invalidated') {
-                    currentPnl -= 1;
-                    b.realizedPnl = -riskAmount;
-                    b.realizedPnlPercent = (b.realizedPnl / equityAtEntry) * 100;
-                    b.assetRoiPercent = b.direction === 'long' ? ((b.sl - b.ep) / b.ep) * 100 : ((b.ep - b.sl) / b.ep) * 100;
-                    currentEquity += b.realizedPnl;
-                }
-            });
-
-            // MDD 추적
-            if (currentEquity > peakEquity) {
-                peakEquity = currentEquity;
             }
+
+            // 3. 대기 중인(Pending) 박스 진입(EP 터치) 처리
+            for (let i = pendingBoxes.length - 1; i >= 0; i--) {
+                const box = pendingBoxes[i];
+                if (c.openTime < box.createdAt) continue;
+
+                let isHitEp = false;
+                if (box.direction === 'long' && c.low <= box.ep) isHitEp = true;
+                if (box.direction === 'short' && c.high >= box.ep) isHitEp = true;
+
+                if (isHitEp) {
+                    // 제한 조건 1: 최대 동시 포지션 개수 초과
+                    if (openPositions.length >= maxPositions) {
+                        box.status = 'canceled';
+                        box.skipReason = 'max_positions';
+                        box.resolvedAt = c.openTime;
+                        finalBoxes.push(box);
+                        pendingBoxes.splice(i, 1);
+                        continue;
+                    }
+
+                    // 포지션 사이즈 및 레버리지 증거금 계산
+                    const riskAmount = currentEquity * (riskPerTrade / 100);
+                    const slPercent = Math.max(Math.abs(box.ep - box.sl) / box.ep, 0.0001);
+                    const idealPosSize = riskAmount / slPercent;
+                    const idealMargin = idealPosSize / leverage;
+                    
+                    // 제한 조건 2: 남은 증거금이 부족하면 진입 불가 (안전 마진 10달러 컷)
+                    const actualMargin = Math.min(idealMargin, availableMargin);
+                    if (actualMargin < 10) { 
+                         box.status = 'canceled';
+                         box.skipReason = 'no_margin';
+                         box.resolvedAt = c.openTime;
+                         finalBoxes.push(box);
+                         pendingBoxes.splice(i, 1);
+                         continue;
+                    }
+
+                    const actualPosSize = actualMargin * leverage;
+                    const actualRisk = actualPosSize * slPercent;
+
+                    // 포지션 진입 확정
+                    box.isEntered = true;
+                    box.enteredAt = c.openTime;
+                    box.positionSize = actualPosSize;
+                    box.marginUsed = actualMargin;
+                    box.riskAmount = actualRisk;
+                    
+                    availableMargin -= actualMargin;
+                    openPositions.push(box);
+                    pendingBoxes.splice(i, 1);
+
+                    // (옵션) 같은 캔들 내에서 진입과 동시에 청산(SL/TP) 도달 시 즉시 처리
+                    let isResolvedNow = false;
+                    let isWinNow = false;
+                    if (box.direction === 'long') {
+                        if (c.low <= box.sl) { isResolvedNow = true; isWinNow = false; }
+                        else if (c.high >= box.tp) { isResolvedNow = true; isWinNow = true; }
+                    } else {
+                        if (c.high >= box.sl) { isResolvedNow = true; isWinNow = false; }
+                        else if (c.low <= box.tp) { isResolvedNow = true; isWinNow = true; }
+                    }
+
+                    if (isResolvedNow) {
+                        const pnl = isWinNow ? (box.riskAmount! * rrRatio) : -box.riskAmount!;
+                        currentEquity += pnl;
+                        availableMargin += box.marginUsed! + pnl; 
+                        totalR += isWinNow ? rrRatio : -1;
+                        
+                        box.status = isWinNow ? 'reacted' : 'invalidated';
+                        box.resolvedAt = c.openTime;
+                        box.realizedPnl = pnl;
+                        box.realizedPnlPercent = (pnl / (currentEquity - pnl)) * 100;
+                        box.assetRoiPercent = isWinNow 
+                            ? (box.direction === 'long' ? ((box.tp - box.ep) / box.ep) * 100 : ((box.ep - box.tp) / box.ep) * 100)
+                            : (box.direction === 'long' ? ((box.sl - box.ep) / box.ep) * 100 : ((box.ep - box.sl) / box.ep) * 100);
+                        
+                        finalBoxes.push(box);
+                        openPositions.pop(); // 방금 넣었던 포지션 바로 제거
+                    }
+                }
+            }
+
+            // MDD 트래킹
+            if (currentEquity > peakEquity) peakEquity = currentEquity;
             const drawdown = ((peakEquity - currentEquity) / peakEquity) * 100;
-            if (drawdown > maxDrawdown) {
-                maxDrawdown = drawdown;
-            }
+            if (drawdown > maxDrawdown) maxDrawdown = drawdown;
 
-            return { time: c.openTime, pnl: currentPnl, equity: currentEquity };
+            return { time: c.openTime, pnl: totalR, equity: currentEquity };
         });
 
-        // 승률 계산
-        const closedTrades = detectedBoxes.filter(b => b.status === 'reacted' || b.status === 'invalidated');
+        // 렌더링을 위해 활성, 대기, 종료된 모든 박스 취합 후 시간순 정렬
+        const allProcessedBoxes = [...finalBoxes, ...pendingBoxes, ...openPositions]
+            .sort((a, b) => a.startIndex - b.startIndex);
+
+        // 승률 통계 (진입 후 청산이 완료된 거래만 카운트)
+        const closedTrades = allProcessedBoxes.filter(b => b.status === 'reacted' || b.status === 'invalidated');
         const wins = closedTrades.filter(b => b.status === 'reacted').length;
         const winRate = closedTrades.length > 0 ? (wins / closedTrades.length) * 100 : 0;
 
         setTradeStats({ winRate, mdd: maxDrawdown, wins, total: closedTrades.length });
-
-        setBoxes(detectedBoxes);
+        setBoxes(allProcessedBoxes);
         setPnlData(curve);
-    }, [rawCandles, rrRatio, interval, initialCapital, riskPerTrade]);
+    }, [rawCandles, rrRatio, interval, initialCapital, riskPerTrade, leverage, maxPositions]);
 
     useEffect(() => {
         fetchData();
@@ -625,7 +695,7 @@ export default function App() {
             ctx.fillText(timeStr, x, height - padding.bottom + 10);
         }
 
-        // 2. 심플해진 박스 그리기 (박스 시각화 및 청산 지점까지 상하단 연장선)
+        // 2. 심플해진 박스 그리기 (취소된 박스 흐리게 표현, 점선 연장)
         boxes.forEach(box => {
             const relStartIdx = box.startIndex - start;
             const relEndIdx = box.endIndex - start;
@@ -640,22 +710,28 @@ export default function App() {
 
             const yHigh = getY(box.high);
             const yLow = getY(box.low);
+            const isCanceled = box.status === 'canceled';
 
             // [1] 박스 그리기
             if (relEndIdx >= 0 && relStartIdx < visibleCandles.length) {
                 const xBoxStart = getX(Math.max(0, relStartIdx));
                 const xBoxEnd = getX(Math.min(visibleCandles.length - 1, relEndIdx)) + candleWidth - spacing * 2;
 
-                ctx.fillStyle = box.direction === 'long' ? 'rgba(34, 197, 94, 0.15)' : 'rgba(239, 68, 68, 0.15)';
+                const bgAlpha = isCanceled ? 0.05 : 0.15;
+                const borderAlpha = isCanceled ? 0.2 : 0.5;
+
+                ctx.fillStyle = box.direction === 'long' ? `rgba(34, 197, 94, ${bgAlpha})` : `rgba(239, 68, 68, ${bgAlpha})`;
                 ctx.fillRect(xBoxStart, yHigh, xBoxEnd - xBoxStart, yLow - yHigh);
                 
-                ctx.strokeStyle = box.direction === 'long' ? 'rgba(34, 197, 94, 0.5)' : 'rgba(239, 68, 68, 0.5)';
+                ctx.strokeStyle = box.direction === 'long' ? `rgba(34, 197, 94, ${borderAlpha})` : `rgba(239, 68, 68, ${borderAlpha})`;
                 ctx.lineWidth = 1;
+                if (isCanceled) ctx.setLineDash([2, 2]); // 취소된 박스는 테두리 점선 처리
                 ctx.strokeRect(xBoxStart, yHigh, xBoxEnd - xBoxStart, yLow - yHigh);
+                ctx.setLineDash([]);
             }
 
-            // [2] 박스 상/하단 연장선 그리기 
-            if (relResolvedIdx > relEndIdx) {
+            // [2] 연장선 그리기 (취소되지 않은 정상 박스만)
+            if (!isCanceled && relResolvedIdx > relEndIdx) {
                 const xExtStart = relEndIdx < 0 ? getX(0) : getX(relEndIdx) + candleWidth - spacing * 2;
                 const xExtEnd = relResolvedIdx >= visibleCandles.length ? getX(visibleCandles.length - 1) + candleWidth / 2 : getX(relResolvedIdx) + candleWidth / 2;
                 
@@ -691,7 +767,7 @@ export default function App() {
             ctx.fillRect(x, rectY, candleWidth - spacing * 2, rectHeight);
         });
 
-        // 3-5. 매매 타점 (진입/청산) 마커 및 숫자 그리기
+        // 3-5. 타점(EP/Exit) 마커 및 숫자 그리기
         boxes.forEach((box, index) => {
             const tradeNum = (index + 1).toString();
 
@@ -721,7 +797,7 @@ export default function App() {
                 }
             }
 
-            if (box.resolvedAt) {
+            if (box.status === 'reacted' || box.status === 'invalidated') {
                 const exitIndex = visibleCandles.findIndex(c => c.openTime === box.resolvedAt);
                 if (exitIndex !== -1) {
                     const candle = visibleCandles[exitIndex];
@@ -729,7 +805,6 @@ export default function App() {
                     
                     const isWin = box.status === 'reacted';
                     const exitColor = isWin ? '#3b82f6' : '#64748b'; 
-                    
                     const placeAbove = (box.direction === 'long' && isWin) || (box.direction === 'short' && !isWin);
                     
                     ctx.beginPath();
@@ -750,7 +825,7 @@ export default function App() {
             }
         });
 
-        // 4. 완벽히 동기화된 PNL 차트 렌더링
+        // 4. 동기화된 PNL 렌더링
         if (pnlCanvasRef.current && visiblePnl.length > 0) {
             const pnlCanvas = pnlCanvasRef.current;
             const pnlCtx = pnlCanvas.getContext('2d');
@@ -807,7 +882,7 @@ export default function App() {
             pnlCtx.closePath(); pnlCtx.fillStyle = gradient; pnlCtx.fill();
         }
 
-        // 5. 완벽히 동기화된 Equity(초기 자본 기반) 차트 렌더링
+        // 5. 동기화된 Equity 렌더링
         if (equityCanvasRef.current && visiblePnl.length > 0) {
             const eqCanvas = equityCanvasRef.current;
             const eqCtx = eqCanvas.getContext('2d');
@@ -875,7 +950,7 @@ export default function App() {
 
     return (
         <div className="min-h-screen bg-slate-900 text-slate-200 p-6 font-sans">
-            <div className="max-w-6xl mx-auto space-y-6">
+            <div className="max-w-7xl mx-auto space-y-6">
                 
                 {/* 헤더 / 컨트롤 */}
                 <div className="flex flex-col xl:flex-row justify-between items-center bg-slate-800 p-4 rounded-xl shadow-lg border border-slate-700 gap-4">
@@ -890,7 +965,7 @@ export default function App() {
                                     <span className="bg-green-500/10 text-green-400 px-2 py-0.5 rounded text-[10px] font-bold border border-green-500/30 uppercase tracking-wider">Live Binance</span>
                                 )}
                             </h1>
-                            <p className="text-sm text-slate-400">Date Range & Strategy Performance</p>
+                            <p className="text-sm text-slate-400">Advanced Chronological Backtester</p>
                         </div>
                     </div>
 
@@ -911,9 +986,9 @@ export default function App() {
                             <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="bg-transparent px-2 py-2 focus:outline-none text-slate-300 [&::-webkit-calendar-picker-indicator]:filter-[invert(1)]" />
                         </div>
 
-                        {/* 초기 자본 및 리스크 설정 */}
+                        {/* 시뮬레이션 설정 (Capital, Risk, Pos, Lev) */}
                         <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus-within:border-blue-500">
-                            <span className="text-slate-400 mr-2 font-medium">Capital: $</span>
+                            <span className="text-slate-400 mr-2 font-medium">Cap: $</span>
                             <input 
                                 type="number" step="1000" min="100" 
                                 value={initialCapital} 
@@ -931,15 +1006,33 @@ export default function App() {
                             />
                             <span className="text-slate-400 ml-1">%</span>
                         </div>
+                        <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus-within:border-blue-500">
+                            <span className="text-slate-400 mr-2 font-medium">Lev: </span>
+                            <input 
+                                type="number" step="1" min="1" max="100" 
+                                value={leverage} 
+                                onChange={(e) => setLeverage(parseFloat(e.target.value) || 10)} 
+                                className="bg-transparent w-10 text-center focus:outline-none text-white font-mono" 
+                            />
+                            <span className="text-slate-400 ml-1">x</span>
+                        </div>
+                        <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus-within:border-blue-500" title="Max Concurrent Positions">
+                            <span className="text-slate-400 mr-2 font-medium">Max Pos: </span>
+                            <input 
+                                type="number" step="1" min="1" max="20" 
+                                value={maxPositions} 
+                                onChange={(e) => setMaxPositions(parseFloat(e.target.value) || 3)} 
+                                className="bg-transparent w-10 text-center focus:outline-none text-white font-mono" 
+                            />
+                        </div>
 
-                        {/* R:R 커스텀 설정기 */}
                         <div className="flex items-center bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus-within:border-blue-500">
                             <span className="text-slate-400 mr-2 font-medium">R:R = 1 : </span>
                             <input 
                                 type="number" step="0.1" min="0.5" max="10" 
                                 value={rrRatio} 
                                 onChange={(e) => setRrRatio(parseFloat(e.target.value) || 2.0)} 
-                                className="bg-transparent w-12 text-center focus:outline-none text-white font-mono" 
+                                className="bg-transparent w-10 text-center focus:outline-none text-white font-mono" 
                             />
                         </div>
 
@@ -970,11 +1063,16 @@ export default function App() {
                                 {loading && <span className="text-xs text-blue-400 animate-pulse">Fetching data & analyzing...</span>}
                                 {!loading && tradeStats.total > 0 && (
                                     <div className="flex gap-3 text-sm font-mono">
-                                        <div className="bg-slate-900/50 px-3 py-1 rounded border border-slate-700">
-                                            <span className="text-slate-400">Win Rate:</span> <span className={tradeStats.winRate >= 50 ? 'text-green-400' : 'text-red-400'}>{tradeStats.winRate.toFixed(1)}%</span> <span className="text-xs text-slate-500">({tradeStats.wins}/{tradeStats.total})</span>
+                                        <div className="bg-slate-900/50 px-3 py-1 rounded border border-slate-700 flex items-center">
+                                            <span className="text-slate-400 mr-2">Win Rate:</span> 
+                                            <span className={`font-bold ${tradeStats.winRate >= 50 ? 'text-green-400' : 'text-red-400'}`}>
+                                                {tradeStats.winRate.toFixed(1)}%
+                                            </span> 
+                                            <span className="text-xs text-slate-500 ml-1">({tradeStats.wins}/{tradeStats.total})</span>
                                         </div>
-                                        <div className="bg-slate-900/50 px-3 py-1 rounded border border-slate-700">
-                                            <span className="text-slate-400">MDD:</span> <span className="text-red-400">-{tradeStats.mdd.toFixed(2)}%</span>
+                                        <div className="bg-slate-900/50 px-3 py-1 rounded border border-slate-700 flex items-center">
+                                            <span className="text-slate-400 mr-2">MDD:</span> 
+                                            <span className="font-bold text-red-400">-{tradeStats.mdd.toFixed(2)}%</span>
                                         </div>
                                     </div>
                                 )}
@@ -985,40 +1083,42 @@ export default function App() {
                         </div>
                     </div>
 
-                    {/* 누적 수익률(PNL) 차트 */}
-                    <div className="bg-slate-800 rounded-xl shadow-lg border border-slate-700 overflow-hidden pointer-events-none">
-                        <div className="p-4 border-b border-slate-700 flex justify-between items-center bg-slate-800/50 pointer-events-auto">
-                            <h2 className="font-semibold text-slate-100 flex items-center gap-2">
-                                <LineChart className="w-5 h-5 text-slate-400" /> 
-                                Synchronized PNL Curve
-                            </h2>
-                            <div className={`text-lg font-bold font-mono ${currentPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                                Total Net: {currentPnl > 0 ? '+' : ''}{currentPnl.toFixed(1)}R
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        {/* 누적 수익률(PNL) 차트 */}
+                        <div className="bg-slate-800 rounded-xl shadow-lg border border-slate-700 overflow-hidden pointer-events-none">
+                            <div className="p-4 border-b border-slate-700 flex justify-between items-center bg-slate-800/50 pointer-events-auto">
+                                <h2 className="font-semibold text-slate-100 flex items-center gap-2">
+                                    <LineChart className="w-5 h-5 text-slate-400" /> 
+                                    Synchronized PNL (R)
+                                </h2>
+                                <div className={`text-lg font-bold font-mono ${currentPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                                    Net: {currentPnl > 0 ? '+' : ''}{currentPnl.toFixed(1)}R
+                                </div>
+                            </div>
+                            <div className="w-full h-[180px] bg-slate-900 relative">
+                                <canvas ref={pnlCanvasRef} className="absolute inset-0 w-full h-full" />
                             </div>
                         </div>
-                        <div className="w-full h-[180px] bg-slate-900 relative">
-                            <canvas ref={pnlCanvasRef} className="absolute inset-0 w-full h-full" />
-                        </div>
-                    </div>
 
-                    {/* Equity(자산 변동) 차트 */}
-                    <div className="bg-slate-800 rounded-xl shadow-lg border border-slate-700 overflow-hidden pointer-events-none">
-                        <div className="p-4 border-b border-slate-700 flex justify-between items-center bg-slate-800/50 pointer-events-auto">
-                            <h2 className="font-semibold text-slate-100 flex items-center gap-2">
-                                <Activity className="w-5 h-5 text-slate-400" /> 
-                                Equity Curve (Compound Growth)
-                            </h2>
-                            <div className="flex items-center gap-4">
-                                <div className="text-xs text-slate-400">
-                                    Initial: ${initialCapital.toLocaleString()}
-                                </div>
-                                <div className={`text-lg font-bold font-mono ${currentEquity >= initialCapital ? 'text-green-400' : 'text-red-400'}`}>
-                                    ${currentEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        {/* Equity(자산 변동) 차트 */}
+                        <div className="bg-slate-800 rounded-xl shadow-lg border border-slate-700 overflow-hidden pointer-events-none">
+                            <div className="p-4 border-b border-slate-700 flex justify-between items-center bg-slate-800/50 pointer-events-auto">
+                                <h2 className="font-semibold text-slate-100 flex items-center gap-2">
+                                    <Activity className="w-5 h-5 text-slate-400" /> 
+                                    Equity Curve ($)
+                                </h2>
+                                <div className="flex items-center gap-4">
+                                    <div className="text-xs text-slate-400">
+                                        Initial: ${initialCapital.toLocaleString()}
+                                    </div>
+                                    <div className={`text-lg font-bold font-mono ${currentEquity >= initialCapital ? 'text-green-400' : 'text-red-400'}`}>
+                                        ${currentEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                    </div>
                                 </div>
                             </div>
-                        </div>
-                        <div className="w-full h-[180px] bg-slate-900 relative">
-                            <canvas ref={equityCanvasRef} className="absolute inset-0 w-full h-full" />
+                            <div className="w-full h-[180px] bg-slate-900 relative">
+                                <canvas ref={equityCanvasRef} className="absolute inset-0 w-full h-full" />
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1055,11 +1155,12 @@ export default function App() {
                                 ) : (
                                     [...boxes].reverse().map(box => {
                                         const tradeNum = boxes.indexOf(box) + 1;
+                                        const isCanceled = box.status === 'canceled';
                                         
                                         return (
-                                        <tr key={box.id} className="hover:bg-slate-750/50 transition-colors">
+                                        <tr key={box.id} className={`transition-colors ${isCanceled ? 'opacity-40 hover:opacity-60 bg-slate-800/20' : 'hover:bg-slate-750/50'}`}>
                                             <td className="p-4 text-center">
-                                                <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-slate-700 text-slate-300 font-bold text-xs">
+                                                <span className={`inline-flex items-center justify-center w-6 h-6 rounded-full font-bold text-xs ${isCanceled ? 'bg-slate-800 text-slate-500' : 'bg-slate-700 text-slate-300'}`}>
                                                     {tradeNum}
                                                 </span>
                                             </td>
@@ -1090,10 +1191,10 @@ export default function App() {
                                                 {box.positionSize ? (
                                                     <div className="flex flex-col">
                                                         <div className="font-mono text-slate-200">
-                                                            ${box.positionSize.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+                                                            Pos: ${box.positionSize.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                                                         </div>
                                                         <div className="text-[11px] text-slate-400 mt-0.5 whitespace-nowrap">
-                                                            Risk: <span className="text-red-400">${box.riskAmount?.toFixed(2)}</span>
+                                                            Margin: <span className="text-slate-300">${box.marginUsed?.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
                                                         </div>
                                                     </div>
                                                 ) : (
@@ -1101,16 +1202,23 @@ export default function App() {
                                                 )}
                                             </td>
                                             <td className="p-4">
-                                                <span className={`inline-flex items-center px-2 py-1 rounded-md text-xs font-medium ${
-                                                    box.status === 'active' 
-                                                        ? (box.isEntered ? 'bg-blue-500/20 text-blue-300' : 'bg-slate-500/20 text-slate-400 border border-slate-500/30')
-                                                        : box.status === 'reacted' ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'
-                                                }`}>
-                                                    {box.status === 'reacted' ? `+${rrRatio}R (Win)` : box.status === 'invalidated' ? '-1R (Loss)' : (box.isEntered ? 'Filled (Active)' : 'Pending (Wait EP)')}
-                                                </span>
+                                                {isCanceled ? (
+                                                    <span className="inline-flex items-center px-2 py-1 rounded-md text-xs font-medium bg-slate-800 text-slate-500 border border-slate-700/50">
+                                                        {box.skipReason === 'max_positions' ? 'Canceled (Max Pos)' : 
+                                                         box.skipReason === 'no_margin' ? 'Canceled (No Margin)' : 'Canceled (SL Hit First)'}
+                                                    </span>
+                                                ) : (
+                                                    <span className={`inline-flex items-center px-2 py-1 rounded-md text-xs font-medium ${
+                                                        box.status === 'active' 
+                                                            ? (box.isEntered ? 'bg-blue-500/20 text-blue-300' : 'bg-slate-500/20 text-slate-400 border border-slate-500/30')
+                                                            : box.status === 'reacted' ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'
+                                                    }`}>
+                                                        {box.status === 'reacted' ? `+${rrRatio}R (Win)` : box.status === 'invalidated' ? '-1R (Loss)' : (box.isEntered ? 'Filled (Active)' : 'Pending (Wait EP)')}
+                                                    </span>
+                                                )}
                                             </td>
                                             <td className="p-4">
-                                                {box.status === 'active' || box.realizedPnl === undefined ? (
+                                                {box.status === 'active' || isCanceled || box.realizedPnl === undefined ? (
                                                     <span className="text-slate-500">-</span>
                                                 ) : (
                                                     <div className="flex flex-col">
