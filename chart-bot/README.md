@@ -1,53 +1,49 @@
 
-# BingX Quantitative Trading Bot (Python)
+# BingX Live Quantitative Trading Bot (Python)
 
-본 프로젝트는 횡보 박스(Sideways Box) 돌파 전략을 기반으로 **BingX 선물 거래소(Perpetual Swap)**에서 24시간 자동으로 매매를 수행하는 파이썬(Python) 기반의 알고리즘 트레이딩 봇입니다.
+본 프로젝트는 횡보 박스(Sideways Box) 돌파 전략을 기반으로 **BingX 선물 거래소(Perpetual Swap)**에서 실전 라이브 매매를 수행하기 위해 극도로 보수적인 안전장치가 적용된 파이썬 알고리즘 트레이딩 봇입니다.
 
-## 1. 시스템 아키텍처 및 주요 모듈
+## 1. 🛡️ 실전 투입을 위한 5대 핵심 안전장치 (Critical Safeties)
 
-시스템은 역할에 따라 4개의 주요 파일로 모듈화되어 있으며, 실제 자본 운용을 위해 매우 보수적인 안전장치들이 겹겹이 적용되어 있습니다.
+큰 자본금을 운용할 때 발생할 수 있는 모든 엣지 케이스(Edge Cases)를 방어하도록 코어 로직이 설계되었습니다.
 
-### 📁 파일 구조
+### 1) 유령 포지션(Ghost Position) 방지 로직
 
-1. **`config.json`**: API 키, Slack 설정, 트레이딩 환경설정(자본금, 레버리지, 리스크, 심볼 등)을 관리합니다.
-2. **`bingx_api.py`**: BingX REST API 통신 및 서명(HMAC-SHA256) 모듈입니다. 일시적인 네트워크 오류에 대비한 **지수 백오프(Exponential Backoff)** 재시도 로직이 내장되어 있습니다.
-3. **`strategy.py`**: 코어 분석 엔진입니다. 캔들스틱 데이터를 받아 각종 기술적 지표(RSI, Volume, Divergence, Pinbar 등)를 계산하고, 유효한 '횡보 박스' 타점을 반환합니다.
-4. **`main.py`**: 메인 봇 실행기입니다. 5분(설정 가능) 주기로 시장을 감시하며 타점 진입 및 청산을 제어하고, Slack으로 실시간 알림을 발송합니다.
+- **이유:** 봇이 5분 간격(Polling)으로 잠든 사이, 가격이 위아래로 거칠게 움직이며 TP나 SL을 '꼬리'로 치고 다시 원상복구되는 경우가 잦습니다.
+- **해결:** 단순히 현재 순간의 가격(`current_price`)만 보지 않고, **과거 5분간의 1분봉 고가/저가(Highest/Lowest) 궤적을 샅샅이 스캔** 합니다. 거래소 단에서 이미 체결된 OCO 주문을 놓치지 않고 100% 잡아내어 내부 회계를 완벽히 일치시킵니다.
 
-## 2. 🛡️ 핵심 매매 로직 및 안전장치 (Safety Mechanisms)
+### 2) 거래소 OCO(One-Cancels-the-Other) 네이티브 청산
 
-거액의 실전 자본 운용 시뮬레이션 및 라이브 환경을 위해 기존 백테스트의 한계를 극복한 고급 기능들이 탑재되어 있습니다.
+- **이유:** 봇이 직접 수익/손실을 판단해서 청산 API를 쏘는 방식은, 봇 서버가 정전되거나 다운되었을 때 자산이 무방비로 방치되는 대형 사고를 유발합니다.
+- **해결:** 시장가 진입 주문(`place_market_order`) 시, API 페이로드에 **목표가(Take Profit)와 손절가(Stop Loss)를 JSON 형태로 묶어서 동시에 전송** 합니다. 서버가 죽더라도 리스크 제어는 BingX 거래소 엔진이 확실하게 보장합니다.
 
-### 2.1. 거래소 기반의 완벽한 손익금(PnL) 계산
+### 3) 붕괴 타점 무효화 (Anti-Flash Crash)
 
-- 단순한 마진 배수 연산이 아닌, **`(청산가격 - 실제 진입가격) × 보유 코인 수량`** 이라는 거래소의 실제 명목가치 산정 방식을 사용합니다.
-- 발생한 달러($) 손익을 정확하게 추적하여 내부 자본금(`available_margin`)에 복리로 반영합니다.
+- **이유:** 비트코인이 순간적으로 폭락하여 진입가(EP)를 뚫고 이미 손절가(SL) 라인까지 무너뜨린 상태일 수 있습니다.
+- **해결:** EP 터치 여부를 검사하기 전에, 먼저 1분봉 궤적이 SL을 먼저 건드렸는지(`is_hit_sl_before`) 최우선으로 검사합니다. 무너진 타점은 진입 없이 즉시 휴지통에 폐기합니다.
 
-### 2.2. 시장 붕괴(Gap-Down) 방어 로직
+### 4) 실 체결 기반 100% 정밀 PnL 회계
 
-- 가격이 5분 주기의 감시 틈을 타서 타점(EP)을 스치고 이미 손절선(SL)을 뚫고 내려간 경우, 봇은 이를 진입 기회가 아닌 '차트 붕괴'로 판단합니다.
-- 이미 망가진 타점에 진입하여 **주문과 동시에 확정 손실을 입는 대참사를 사전에 차단** 합니다.
+- 백테스트용 단순 배수 계산(`Margin * Leverage * RR`)을 완전히 버렸습니다.
+- 롱(Long): `(TP/SL - 진입가) * 코인수량`, 숏(Short): `(진입가 - TP/SL) * 코인수량` 이라는 **선물 거래소의 실제 PnL 산정 공식** 을 사용하여 복리(`available_margin`) 스냅샷의 오차를 0으로 만들었습니다.
 
-### 2.3. 최소 주문 단위(Lot Size) 정밀도 호환
+### 5) 데이터 정밀도 자동 규격화 (Format Integrity)
 
-- 코인별로 존재하는 최소 주문 수량 규격(`tradeMinQuantity`)을 봇 부팅 시 자동으로 캐싱합니다.
-- 내부 로직으로 구해진 정밀한 진입 물량(예: `0.1539999`)을 거래소 규격(`0.1539`)에 맞게 **버림(Truncate)** 처리하여 `Invalid Quantity` 주문 거절 에러를 방지합니다.
+- 거래소마다 허용하는 '최소 주문 수량(Step Size)'과 '가격 소수점(Tick Size)'이 엄격하게 정해져 있습니다.
+- 부팅 시 해당 코인의 스펙을 가져와 수량은 안전하게 버림(`truncate_quantity`) 처리하고, TP/SL 가격은 포맷팅(`format_price`)하여 `Invalid API Request` 로 인한 기회 손실을 막습니다.
 
-### 2.4. 미확정 캔들 배제 (Repainting 방지)
+## 2. 파일 구조 (Architecture)
 
-- 아직 진행 중인 최신 캔들은 실시간으로 가격이 변동하므로 거짓 타점을 유발할 수 있습니다.
-- 봇은 수신한 데이터 중 아직 닫히지 않은 최신 캔들을 즉시 잘라내어(`[:-1]`), 타점이 나타났다 사라지는 리페인팅(Repainting) 현상을 방지합니다.
+1. **`config.json`**: API 키, Slack 채널/토큰, 자본금, 레버리지, 리스크 등을 제어합니다.
+2. **`bingx_api.py`**: BingX REST API 통신 및 서명 생성, **지수 백오프(Exponential Backoff)** 오류 자동 재시도.
+3. **`strategy.py`**: OHLCV 기반 횡보 박스(Sideways Box) 추출 엔진.
+4. **`main.py`**: 메인 무한 루프, 포지션 추적, Slack (Bot Token) 연동, 봇 상태 보존(`bot_state.json`).
 
-### 2.5. 상태 영구 보존 (Persistence)
-
-- 봇이 진입/청산할 때마다 **`bot_state.json`** 파일에 현재 남은 자본금과 열려있는 포지션 정보를 기록합니다.
-- 서버 재부팅 시에도 초기 자본금이 아닌 마지막으로 기록된 상태를 불러와 완벽하게 매매를 이어나갑니다.
-
-## 3. 설치 및 실행 가이드 (Installation & Setup)
+## 3. 설치 및 실행 가이드 (Quick Start)
 
 ### Step 1. 요구 사항 및 패키지 설치
 
-Python 3.8 이상 환경이 필요합니다. 터미널에서 `requests` 라이브러리를 설치합니다.
+Python 3.8 이상 환경이 필요하며, 장기 구동을 위해 클라우드(AWS EC2 등) 환경을 권장합니다.
 
 ```
 pip install requests
@@ -55,17 +51,17 @@ pip install requests
 
 ### Step 2. `config.json` 설정
 
-프로젝트 루트 디렉토리에 `config.json` 파일을 생성하고 아래 양식에 맞게 본인의 정보를 입력합니다.
+프로젝트 루트 디렉토리에 `config.json` 을 생성하고 본인의 정보를 입력합니다.
 
 ```
 {
   "api": {
-    "bingx_api_key": "YOUR_BINGX_API_KEY",
-    "bingx_secret_key": "YOUR_BINGX_SECRET_KEY"
+    "bingx_api_key": "YOUR_API_KEY",
+    "bingx_secret_key": "YOUR_SECRET_KEY"
   },
   "slack": {
     "token": "xoxb-your-slack-bot-token",
-    "channel": "#your-channel-name"
+    "channel": "#channel-name"
   },
   "trading": {
     "symbol": "BTC-USDT",
@@ -81,29 +77,17 @@ pip install requests
 }
 ```
 
-### Step 3. 봇 실행 (Paper Trading Mode)
+### Step 3. 모의 투자(Paper Trading) 모드 테스트
 
-안전을 위해 기본 코드는 **주문 전송 부분이 주석 처리된 모의 매매(Paper Trading) 모드** 로 동작합니다.
+자산을 잃을 위험 없이 먼저 알림이 잘 오는지, 로직이 맞게 돌아가는지 테스트합니다. 기본 코드는 매매 API 호출이 안전하게 주석 처리되어 있습니다.
 
 ```
 python main.py
 ```
+Slack으로 봇 시작 알림과 타점 감지 내역이 전송되는지 확인합니다.
 
-- 실행 즉시 지정된 Slack 채널로 시작 알림이 발송됩니다.
-- 터미널 및 Slack을 통해 타점 감지, 모의 진입, 모의 청산 내역을 확인할 수 있습니다.
+### Step 4. 🔥 실전 라이브 매매(Live Trading) 가동
 
-### Step 4. 실전 라이브 매매(Live Trading) 활성화
+모의 운영을 통해 확신이 생기면, `main.py` 파일의 **`# TODO: 실제 돈이 들어가는 라이브 매매`** 라인 아래에 있는 `bingx.place_market_order(...)` 함수의 주석을 해제합니다.
 
-충분한 모의 테스트 후 실제 자금을 투입하려면 `main.py` 파일을 열고 다음을 수행하세요.
-
-1. `run_bot()` 함수 내의 진입 검사 로직(3번 항목)에서 `bingx.place_market_order(...)` 부분의 주석을 해제합니다.
-2. 청산 검사 로직(4번 항목)에서 실제 청산 주문 전송 로직의 주석을 해제합니다. (또는 빙엑스의 포지션 자동 TP/SL 기능을 세팅하도록 코드를 수정하여 활용할 수 있습니다.)
-
-## 4. 프롬프트 히스토리 (Prompt Evolution)
-
-이 시스템을 구축하기 위해 AI 어시스턴트와 협업한 논리적 지시 과정입니다.
-
-1. **코어 엔진 및 UI 구축**: TypeScript로 바이낸스 API 연동, OHLCV 수집, 횡보 박스 아키타입 분류, 지표(RSI/거래량) 점수화, React UI 구현.
-2. **시뮬레이션 및 시각화**: 마우스 Pan/Zoom, 동기화된 PNL/Equity Curve, 고정 리스크 포지션 사이징 적용.
-3. **시계열 백테스트 강화**: 실전과 동일한 시계열 루프 전환, 잔여 증거금 추적, 최대 포지션 제한 로직 구현.
-4. **Python 실전 봇 포팅 (현재)**: BingX 거래소 API 연결, 5분 Polling 시스템, Slack (Bot Token) 연동, 주문 정밀도(Lot Size) 캐싱, 리페인팅 및 차트 붕괴(SL 先 터치) 예외 처리 로직 적용.
+재실행 시 실제 API를 통해 돈이 투입되며, 거래소에 TP/SL이 OCO 조건부 주문으로 자동 세팅됩니다!
