@@ -10,10 +10,14 @@ from strategy import SidewaysBoxDetector
 # ==========================================
 # 환경 설정 및 초기화
 # ==========================================
-CONFIG_FILE = 'config.json'
-STATE_FILE = 'bot_state.json'
+# 현재 파이썬 스크립트 파일이 위치한 폴더의 절대 경로를 가져옵니다. (Windows/Linux 모두 완벽 호환)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-with open(CONFIG_FILE, 'r') as f:
+CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
+STATE_FILE = os.path.join(BASE_DIR, 'bot_state.json')
+
+# Windows 환경 호환성을 위해 encoding='utf-8'을 명시합니다.
+with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
 
 api_config = config['api']

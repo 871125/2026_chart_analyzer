@@ -68,15 +68,16 @@ class BingXClient:
             
         res = self._request('GET', '/openApi/swap/v3/quote/klines', params)
         candles = []
+        # BingX는 배열이 아닌 Dictionary 형태로 데이터를 반환하므로 Key 값으로 접근하도록 수정
         for row in res.get('data', []):
             candles.append({
-                'open_time': int(row[0]),
-                'open': float(row[1]),
-                'close': float(row[2]),
-                'high': float(row[3]),
-                'low': float(row[4]),
-                'volume': float(row[5]),
-                'is_bullish': float(row[2]) >= float(row[1])
+                'open_time': int(row['time']),
+                'open': float(row['open']),
+                'close': float(row['close']),
+                'high': float(row['high']),
+                'low': float(row['low']),
+                'volume': float(row['volume']),
+                'is_bullish': float(row['close']) >= float(row['open'])
             })
         return candles
 
