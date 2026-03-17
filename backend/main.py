@@ -107,13 +107,46 @@ except Exception as e:
     trade_step_size = 0.0001
 
 # ==========================================
+# 캔들 과거 데이터 조회 유틸리티 (Pagination)
+# ==========================================
+def fetch_all_candles_since(symbol: str, interval: str, start_date_str: str) -> list:
+    """config에 명시된 start_date부터 현재까지의 모든 캔들을 가져옵니다."""
+    start_date_dt = datetime.datetime.strptime(start_date_str, "%Y-%m-%d")
+    start_time_ms = int(start_date_dt.timestamp() * 1000)
+    current_time_ms = int(time.time() * 1000)
+    
+    all_candles = []
+    limit = 1000
+    
+    while start_time_ms < current_time_ms:
+        try:
+            candles = bingx.get_klines(symbol, interval, limit=limit, start_time=start_time_ms)
+            if not candles:
+                break
+            
+            all_candles.extend(candles)
+            # 다음 API 호출을 위해 마지막 캔들의 오픈 시간 + 1ms로 갱신
+            start_time_ms = candles[-1]['open_time'] + 1
+            
+            # 가져온 캔들 수가 limit보다 작으면 최신 데이터까지 모두 가져온 것
+            if len(candles) < limit:
+                break
+        except Exception as e:
+            print(f"⚠️ 캔들 데이터 로드 중 오류 발생: {e}")
+            time.sleep(1)
+            
+    # 캔들 중복 제거 및 시간순 정렬 보장
+    unique_candles = {c['open_time']: c for c in all_candles}
+    return [unique_candles[k] for k in sorted(unique_candles.keys())]
+
+# ==========================================
 # 메인 트레이딩 루프 로직
 # ==========================================
 def run_bot():
     print(f"--- 매매 로직 틱 실행 중 (잔여 증거금: ${bot_state['available_margin']:.2f}) ---")
     
-    # 1. 4시간봉 데이터 조회 (박스 감지용)
-    candles_4h = bingx.get_klines(trade_config['symbol'], trade_config['box_timeframe'], limit=500)
+    # 1. 4시간봉 데이터 조회 (config의 start_date 기준 전체 스캔)
+    candles_4h = fetch_all_candles_since(trade_config['symbol'], trade_config['box_timeframe'], trade_config['start_date'])
     current_time_ms = int(time.time() * 1000)
     
     # 미확정 캔들 배제 (리페인팅 방지)
@@ -121,7 +154,8 @@ def run_bot():
         candles_4h = candles_4h[:-1] 
 
     all_boxes = detector.detect(candles_4h, trade_config['box_timeframe'], trade_config['rr_ratio'])
-    pending_boxes = [b for b in all_boxes if b['created_at'] > current_time_ms - (86400 * 1000 * 3)]
+    expiration_days = trade_config.get('pending_box_expiration_days', 3)
+    pending_boxes = [b for b in all_boxes if b['created_at'] > current_time_ms - (86400 * 1000 * expiration_days)]
 
     # 2. 최근 1분봉 데이터 스캔 (스파이크/꼬리 감지용)
     # 봇이 쉬는 5분 동안 가격이 TP/SL을 치고 왔는지 확인하기 위해 최근 10분간의 High/Low를 수집합니다.
