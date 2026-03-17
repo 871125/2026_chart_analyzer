@@ -79,6 +79,7 @@ def save_state(state: dict):
         json.dump(state_copy, f, indent=2)
 
 bot_state = load_state()
+save_state(bot_state)
 
 # ==========================================
 # 데이터 정밀도 유틸리티 (에러 방지)
