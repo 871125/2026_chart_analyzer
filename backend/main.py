@@ -157,6 +157,10 @@ def run_bot():
     expiration_days = trade_config.get('pending_box_expiration_days', 3)
     pending_boxes = [b for b in all_boxes if b['created_at'] > current_time_ms - (86400 * 1000 * expiration_days)]
 
+    # 프론트엔드 차트 시각화를 위해 상태 객체에 pending_boxes 주입 및 강제 저장 플래그 활성화
+    bot_state['pending_boxes'] = pending_boxes
+    state_changed = True
+
     # 2. 최근 1분봉 데이터 스캔 (스파이크/꼬리 감지용)
     # 봇이 쉬는 5분 동안 가격이 TP/SL을 치고 왔는지 확인하기 위해 최근 10분간의 High/Low를 수집합니다.
     recent_1m_candles = bingx.get_klines(trade_config['symbol'], "1m", limit=10)

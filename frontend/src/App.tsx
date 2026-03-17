@@ -18,10 +18,20 @@ interface ActivePosition {
     status: string;
 }
 
+interface PendingBox {
+    id: string;
+    direction: 'long' | 'short';
+    created_at: number;
+    ep: number;
+    sl: number;
+    tp: number;
+}
+
 interface BotState {
     available_margin: number;
     active_positions: ActivePosition[];
     known_boxes: string[];
+    pending_boxes?: PendingBox[];
     last_updated?: number;
 }
 
@@ -198,6 +208,34 @@ export default function LiveBotDashboard() {
             const rectHeight = Math.max(Math.abs(yOpen - yClose), 1);
             ctx.fillRect(x, rectY, candleWidth - spacing * 2, rectHeight);
         });
+
+        // 2.5 대기 중인 타점 박스(Pending Boxes) 그리기
+        if (botState?.pending_boxes) {
+            botState.pending_boxes.forEach(box => {
+                // 이미 진입한 포지션이라면 대기 박스는 그리지 않음
+                const isActive = botState.active_positions.some(p => p.id === box.id);
+                if (isActive) return;
+
+                const yEp = getY(box.ep);
+                const ySl = getY(box.sl);
+                
+                // 박스가 생성된 시간의 캔들 X좌표 찾기
+                const startIdx = candles.findIndex(c => c.openTime >= box.created_at);
+                const startX = startIdx !== -1 ? getX(startIdx) : padding.left;
+                
+                const boxWidth = (width - padding.right) - startX;
+                const boxHeight = Math.abs(ySl - yEp);
+                const boxY = Math.min(yEp, ySl);
+
+                // 박스 채우기 (롱: 초록색 반투명, 숏: 빨간색 반투명)
+                ctx.fillStyle = box.direction === 'long' ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)';
+                ctx.fillRect(startX, boxY, boxWidth, boxHeight);
+
+                ctx.fillStyle = box.direction === 'long' ? 'rgba(16, 185, 129, 0.8)' : 'rgba(239, 68, 68, 0.8)';
+                ctx.font = '10px sans-serif';
+                ctx.fillText(`Wait: ${box.direction.toUpperCase()} EP`, startX + 5, boxY + 12);
+            });
+        }
 
         // 3. 현재 활성 포지션 가이드라인 그리기 (SL, EP, TP)
         if (botState?.active_positions) {
@@ -485,6 +523,16 @@ function generateMockBotState(currentPrice: number): BotState {
     return {
         available_margin: 8750.50,
         known_boxes: ['box_123', 'box_124'],
+        pending_boxes: [
+            {
+                id: 'pending_mock_1',
+                direction: 'long',
+                created_at: Date.now() - (86400000 * 1.5), // 1.5일 전 생성
+                ep: currentPrice - 500,
+                sl: currentPrice - 1200,
+                tp: currentPrice + 1500,
+            }
+        ],
         active_positions: [
             {
                 id: 'box_mock_1',
