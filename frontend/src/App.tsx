@@ -510,6 +510,73 @@ export default function LiveBotDashboard() {
                     </div>
                 </div>
 
+                {/* 5. 대기 중인 타점(Pending Boxes) 테이블 */}
+                <div className="bg-slate-900 border border-slate-800 rounded-xl shadow-lg overflow-hidden mt-4 md:mt-6">
+                    <div className="px-4 py-3 md:px-5 md:py-4 border-b border-slate-800 flex justify-between items-center">
+                        <h2 className="font-semibold text-sm md:text-base text-slate-200">Pending Zones (Waiting for EP)</h2>
+                        <span className="text-xs font-mono bg-slate-800 text-slate-400 px-2 py-1 rounded border border-slate-700">
+                            Count: {botState?.pending_boxes?.filter(b => !botState.active_positions.some(p => p.id === b.id)).length || 0}
+                        </span>
+                    </div>
+                    <div className="overflow-x-auto touch-pan-x">
+                        <table className="w-full text-left text-xs md:text-sm whitespace-nowrap">
+                            <thead className="bg-slate-950/50 text-slate-400">
+                                <tr>
+                                    <th className="px-3 md:px-5 py-2.5 md:py-3 font-medium">Created At</th>
+                                    <th className="px-3 md:px-5 py-2.5 md:py-3 font-medium">Direction</th>
+                                    <th className="px-3 md:px-5 py-2.5 md:py-3 font-medium">Entry Price (EP)</th>
+                                    <th className="px-3 md:px-5 py-2.5 md:py-3 font-medium">Stop Loss (SL)</th>
+                                    <th className="px-3 md:px-5 py-2.5 md:py-3 font-medium">Take Profit (TP)</th>
+                                    <th className="px-3 md:px-5 py-2.5 md:py-3 font-medium">Distance to EP</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800">
+                                {!botState || !botState.pending_boxes || botState.pending_boxes.filter(b => !botState.active_positions.some(p => p.id === b.id)).length === 0 ? (
+                                    <tr>
+                                        <td colSpan={6} className="px-3 md:px-5 py-8 md:py-10 text-center text-slate-500 whitespace-normal">
+                                            No pending zones at the moment.
+                                        </td>
+                                    </tr>
+                                ) : (
+                                    botState.pending_boxes
+                                        .filter(b => !botState.active_positions.some(p => p.id === b.id))
+                                        .sort((a, b) => b.created_at - a.created_at) // 최신순 정렬
+                                        .map((box) => {
+                                        const isLong = box.direction === 'long';
+                                        const distToEp = Math.abs(currentPrice - box.ep);
+                                        const distPercent = currentPrice > 0 ? (distToEp / currentPrice) * 100 : 0;
+
+                                        return (
+                                            <tr key={box.id} className="hover:bg-slate-800/50 transition-colors">
+                                                <td className="px-3 md:px-5 py-3 md:py-4">
+                                                    <div className="font-medium text-slate-300">
+                                                        {new Date(box.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                                                    </div>
+                                                </td>
+                                                <td className="px-3 md:px-5 py-3 md:py-4">
+                                                    <span className={`inline-flex items-center gap-1 px-2 py-1 md:px-2.5 md:py-1 rounded-full text-[10px] md:text-xs font-bold ${
+                                                        isLong ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400'
+                                                    }`}>
+                                                        {isLong ? <TrendingUp className="w-3 h-3 md:w-3.5 md:h-3.5" /> : <TrendingDown className="w-3 h-3 md:w-3.5 md:h-3.5" />}
+                                                        {box.direction.toUpperCase()}
+                                                    </span>
+                                                </td>
+                                                <td className="px-3 md:px-5 py-3 md:py-4 font-mono font-bold text-blue-400">${box.ep.toFixed(2)}</td>
+                                                <td className="px-3 md:px-5 py-3 md:py-4 font-mono text-red-400">${box.sl.toFixed(2)}</td>
+                                                <td className="px-3 md:px-5 py-3 md:py-4 font-mono text-emerald-400">${box.tp.toFixed(2)}</td>
+                                                <td className="px-3 md:px-5 py-3 md:py-4">
+                                                    <div className="font-mono text-slate-300">${distToEp.toFixed(2)}</div>
+                                                    <div className="text-[10px] md:text-xs text-slate-500 mt-0.5">{distPercent.toFixed(2)}% away</div>
+                                                </td>
+                                            </tr>
+                                        );
+                                    })
+                                )}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
             </div>
         </div>
     );
