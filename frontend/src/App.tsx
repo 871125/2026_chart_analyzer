@@ -89,7 +89,7 @@ export default function LiveBotDashboard() {
             } else {
                 try {
                     // Python 폴더에서 python -m http.server 8000 실행 시 접근 가능
-                    const stateRes = await fetch('http://localhost:8000/bot_state.json', { cache: "no-store" });
+                    const stateRes = await fetch(`http://${window.location.hostname}:8000/bot_state.json`, { cache: "no-store" });
                     if (!stateRes.ok) throw new Error("서버 응답 오류");
                     stateData = await stateRes.json();
                 } catch (e) {
