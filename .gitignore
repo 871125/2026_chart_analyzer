@@ -2,3 +2,6 @@ chart-bot/config.json
 chart-bot/__pycache__/bingx_api.cpython-312.pyc
 chart-bot/__pycache__/strategy.cpython-312.pyc
 backend/config.json
+backend/bot_state.json
+backend/__pycache__/bingx_api.cpython-314.pyc
+backend/__pycache__/strategy.cpython-314.pyc

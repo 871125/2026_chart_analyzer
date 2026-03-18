@@ -161,7 +161,33 @@ def run_bot():
 
     all_boxes = detector.detect(candles_data, interval_str, trade_config['rr_ratio'])
     expiration_days = trade_config.get('pending_box_expiration_days', 3)
-    pending_boxes = [b for b in all_boxes if b['created_at'] > current_time_ms - (86400 * 1000 * expiration_days)]
+    limit_time = current_time_ms - (86400 * 1000 * expiration_days)
+
+    pending_boxes = []
+    
+    # 생성 이후 ~ 직전 캔들까지의 흐름을 스캔하여 이미 타점을 스치고 간 박스 필터링 (뒷북 진입 방지)
+    historical_candles = candles_data[:-1] if len(candles_data) > 0 else []
+    
+    for box in all_boxes:
+        if box['created_at'] < limit_time:
+            continue
+            
+        subsequent_candles = [c for c in historical_candles if c['open_time'] >= box['created_at']]
+        
+        is_already_reacted = False
+        for c in subsequent_candles:
+            # SL 또는 EP 터치 확인 (이미 과거에 기회가 지나갔거나 무효화된 박스)
+            if box['direction'] == 'long':
+                if c['low'] <= box['sl'] or c['low'] <= box['ep']:
+                    is_already_reacted = True
+                    break
+            elif box['direction'] == 'short':
+                if c['high'] >= box['sl'] or c['high'] >= box['ep']:
+                    is_already_reacted = True
+                    break
+                
+        if not is_already_reacted:
+            pending_boxes.append(box)
 
     # 프론트엔드 차트 시각화를 위해 상태 객체에 pending_boxes 주입 및 강제 저장 플래그 활성화
     bot_state['pending_boxes'] = pending_boxes

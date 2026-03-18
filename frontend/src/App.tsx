@@ -232,18 +232,25 @@ export default function LiveBotDashboard() {
             ctx.fillRect(x, rectY, candleWidth - spacing * 2, rectHeight);
         });
 
+        const rawActive = botState?.active_positions || {};
+        const activePositions = Array.isArray(rawActive) ? rawActive : Object.values(rawActive);
+        
+        const rawPending = botState?.pending_boxes || (botState as any)?.pending_positions || {};
+        const pendingBoxes = Array.isArray(rawPending) ? rawPending : Object.values(rawPending);
+
         // 2.5 대기 중인 타점 박스(Pending Boxes) 그리기
-        if (botState?.pending_boxes) {
-            botState.pending_boxes.forEach(box => {
+        if (pendingBoxes.length > 0) {
+            pendingBoxes.forEach((box: any) => {
                 // 이미 진입한 포지션이라면 대기 박스는 그리지 않음
-                const isActive = botState.active_positions.some(p => p.id === box.id);
+                const isActive = activePositions.some((p: any) => p.id === box.id);
                 if (isActive) return;
 
                 const yEp = getY(box.ep);
                 const ySl = getY(box.sl);
                 
                 // 박스가 생성된 시간의 캔들 X좌표 찾기
-                const startIdx = candles.findIndex(c => c.openTime >= box.created_at);
+                const createdAtMs = box.created_at < 100000000000 ? box.created_at * 1000 : box.created_at;
+                const startIdx = candles.findIndex(c => c.openTime >= createdAtMs);
                 const startX = startIdx !== -1 ? getX(startIdx) : padding.left;
                 
                 const boxWidth = (width - padding.right) - startX;
@@ -261,8 +268,8 @@ export default function LiveBotDashboard() {
         }
 
         // 3. 현재 활성 포지션 가이드라인 그리기 (SL, EP, TP)
-        if (botState?.active_positions) {
-            botState.active_positions.forEach(pos => {
+        if (activePositions.length > 0) {
+            activePositions.forEach((pos: any) => {
                 const yEp = getY(pos.entry_price_actual);
                 const ySl = getY(pos.sl);
                 const yTp = getY(pos.tp);
@@ -325,18 +332,22 @@ export default function LiveBotDashboard() {
     // 파생 데이터 계산 (미실현 손익 등)
     // ==========================================
     let totalUnrealizedPnL = 0;
+
+    const rawActive = botState?.active_positions || {};
+    const activePositions = Array.isArray(rawActive) ? rawActive : Object.values(rawActive);
     
-    if (botState && botState.active_positions) {
-        botState.active_positions.forEach(pos => {
-            const isLong = pos.direction === 'long';
-            const priceDiff = isLong ? (currentPrice - pos.entry_price_actual) : (pos.entry_price_actual - currentPrice);
-            const unrealized = priceDiff * pos.quantity;
-            totalUnrealizedPnL += unrealized;
-        });
-    }
+    const rawPending = botState?.pending_boxes || (botState as any)?.pending_positions || {};
+    const pendingBoxes = Array.isArray(rawPending) ? rawPending : Object.values(rawPending);
+    
+    activePositions.forEach((pos: any) => {
+        const isLong = pos.direction === 'long';
+        const priceDiff = isLong ? (currentPrice - pos.entry_price_actual) : (pos.entry_price_actual - currentPrice);
+        const unrealized = priceDiff * pos.quantity;
+        totalUnrealizedPnL += unrealized;
+    });
 
     const totalEquity = (botState?.available_margin || 0) + 
-                        (botState?.active_positions.reduce((sum, pos) => sum + pos.margin_used, 0) || 0) + 
+                        activePositions.reduce((sum: number, pos: any) => sum + (pos.margin_used || 0), 0) + 
                         totalUnrealizedPnL;
 
     return (
@@ -435,7 +446,7 @@ export default function LiveBotDashboard() {
                             <Crosshair className="w-3.5 h-3.5 shrink-0" /> Positions
                         </div>
                         <div className="text-lg sm:text-xl md:text-2xl font-bold font-mono text-blue-400 truncate">
-                            {botState?.active_positions.length || 0} <span className="text-xs md:text-sm text-slate-500 font-sans">/ 3</span>
+                            {activePositions.length} <span className="text-xs md:text-sm text-slate-500 font-sans">/ 3</span>
                         </div>
                     </div>
                 </div>
@@ -476,18 +487,18 @@ export default function LiveBotDashboard() {
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-800">
-                                {!botState || botState.active_positions.length === 0 ? (
+                                {activePositions.length === 0 ? (
                                     <tr>
                                         <td colSpan={6} className="px-3 md:px-5 py-8 md:py-10 text-center text-slate-500 whitespace-normal">
                                             No active positions at the moment.<br className="md:hidden" /> Waiting for signals...
                                         </td>
                                     </tr>
                                 ) : (
-                                    botState.active_positions.map((pos) => {
+                                    activePositions.map((pos: any) => {
                                         const isLong = pos.direction === 'long';
                                         const priceDiff = isLong ? (currentPrice - pos.entry_price_actual) : (pos.entry_price_actual - currentPrice);
                                         const uPnl = priceDiff * pos.quantity;
-                                        const uPnlPercent = (uPnl / pos.margin_used) * 100;
+                                        const uPnlPercent = pos.margin_used ? (uPnl / pos.margin_used) * 100 : 0;
 
                                         return (
                                             <tr key={pos.id} className="hover:bg-slate-800/50 transition-colors">
@@ -538,7 +549,7 @@ export default function LiveBotDashboard() {
                     <div className="px-4 py-3 md:px-5 md:py-4 border-b border-slate-800 flex justify-between items-center">
                         <h2 className="font-semibold text-sm md:text-base text-slate-200">Pending Zones (Waiting for EP)</h2>
                         <span className="text-xs font-mono bg-slate-800 text-slate-400 px-2 py-1 rounded border border-slate-700">
-                            Count: {botState?.pending_boxes?.filter(b => !botState.active_positions.some(p => p.id === b.id)).length || 0}
+                            Count: {pendingBoxes.filter((b: any) => !activePositions.some((p: any) => p.id === b.id)).length}
                         </span>
                     </div>
                     <div className="overflow-x-auto touch-pan-x">
@@ -554,26 +565,27 @@ export default function LiveBotDashboard() {
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-800">
-                                {!botState || !botState.pending_boxes || botState.pending_boxes.filter(b => !botState.active_positions.some(p => p.id === b.id)).length === 0 ? (
+                                {pendingBoxes.filter((b: any) => !activePositions.some((p: any) => p.id === b.id)).length === 0 ? (
                                     <tr>
                                         <td colSpan={6} className="px-3 md:px-5 py-8 md:py-10 text-center text-slate-500 whitespace-normal">
                                             No pending zones at the moment.
                                         </td>
                                     </tr>
                                 ) : (
-                                    botState.pending_boxes
-                                        .filter(b => !botState.active_positions.some(p => p.id === b.id))
-                                        .sort((a, b) => b.created_at - a.created_at) // 최신순 정렬
-                                        .map((box) => {
+                                    pendingBoxes
+                                        .filter((b: any) => !activePositions.some((p: any) => p.id === b.id))
+                                        .sort((a: any, b: any) => b.created_at - a.created_at) // 최신순 정렬
+                                        .map((box: any) => {
                                         const isLong = box.direction === 'long';
                                         const distToEp = Math.abs(currentPrice - box.ep);
                                         const distPercent = currentPrice > 0 ? (distToEp / currentPrice) * 100 : 0;
+                                        const createdAtMs = box.created_at < 100000000000 ? box.created_at * 1000 : box.created_at;
 
                                         return (
                                             <tr key={box.id} className="hover:bg-slate-800/50 transition-colors">
                                                 <td className="px-3 md:px-5 py-3 md:py-4">
                                                     <div className="font-medium text-slate-300">
-                                                        {new Date(box.created_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                                                        {new Date(createdAtMs).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                                                     </div>
                                                 </td>
                                                 <td className="px-3 md:px-5 py-3 md:py-4">
