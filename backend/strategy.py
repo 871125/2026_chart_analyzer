@@ -143,15 +143,27 @@ class SidewaysBoxDetector:
 
     def _get_archetype(self, candles, start_idx, b_idx, interval):
         length = b_idx - start_idx
+        c1 = candles[b_idx - 2] if b_idx >= 2 else None
+        c2 = candles[b_idx - 1] if b_idx >= 1 else None
+        
         if length >= 10 and Indicators.has_volume_expansion(candles, b_idx - 1):
             return 'turning_point_base'
+            
+        if length >= 10 and c1 and c2 and c1['is_bullish'] != c2['is_bullish'] and Indicators.is_engulfing(c1, c2):
+            return 'breakout_prep_box'
+            
+        if interval == '1h' and 10 <= length <= 40:
+            return 'continuation_box'
         if interval == '4h' and 5 <= length <= 15:
+            return 'continuation_box'
+        if interval == '1d' and 1 <= length <= 3:
             return 'continuation_box'
         return 'unknown'
 
     def _calc_score(self, candles, rsi, b_idx, arch, direction):
         score = 60
         if arch == 'continuation_box': score += 10
+        if arch == 'breakout_prep_box': score += 15
         if arch == 'turning_point_base': score += 20
         if Indicators.is_pinbar(candles[b_idx]): score += 8
         if rsi[b_idx] <= 30 or rsi[b_idx] >= 70: score += 8

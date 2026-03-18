@@ -145,15 +145,21 @@ def fetch_all_candles_since(symbol: str, interval: str, start_date_str: str) -> 
 def run_bot():
     print(f"--- 매매 로직 틱 실행 중 (잔여 증거금: ${bot_state['available_margin']:.2f}) ---")
     
-    # 1. 4시간봉 데이터 조회 (config의 start_date 기준 전체 스캔)
-    candles_4h = fetch_all_candles_since(trade_config['symbol'], trade_config['box_timeframe'], trade_config['start_date'])
+    # 1. 설정된 타임프레임 데이터 조회 (config의 start_date 기준 전체 스캔)
+    interval_str = trade_config['box_timeframe']
+    candles_data = fetch_all_candles_since(trade_config['symbol'], interval_str, trade_config['start_date'])
     current_time_ms = int(time.time() * 1000)
     
-    # 미확정 캔들 배제 (리페인팅 방지)
-    if candles_4h[-1]['open_time'] + (4 * 60 * 60 * 1000) > current_time_ms:
-        candles_4h = candles_4h[:-1] 
+    # 미확정 캔들 배제 (리페인팅 방지 로직 동적 적용)
+    interval_ms = 4 * 60 * 60 * 1000 # default fallback
+    if interval_str.endswith('h'): interval_ms = int(interval_str[:-1]) * 60 * 60 * 1000
+    elif interval_str.endswith('d'): interval_ms = int(interval_str[:-1]) * 24 * 60 * 60 * 1000
+    elif interval_str.endswith('m'): interval_ms = int(interval_str[:-1]) * 60 * 1000
+        
+    if candles_data[-1]['open_time'] + interval_ms > current_time_ms:
+        candles_data = candles_data[:-1] 
 
-    all_boxes = detector.detect(candles_4h, trade_config['box_timeframe'], trade_config['rr_ratio'])
+    all_boxes = detector.detect(candles_data, interval_str, trade_config['rr_ratio'])
     expiration_days = trade_config.get('pending_box_expiration_days', 3)
     pending_boxes = [b for b in all_boxes if b['created_at'] > current_time_ms - (86400 * 1000 * expiration_days)]
 
