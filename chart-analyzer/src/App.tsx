@@ -5,7 +5,7 @@ import { Activity, TrendingUp, TrendingDown, AlertCircle, RefreshCw, Box as BoxI
 // 1. 코어 엔진 로직
 // ==========================================
 
-export type CandleInterval = '4h' | '1d';
+export type CandleInterval = '1h' | '4h' | '1d';
 export type ZoneType = 'order_block' | 'volume_zone' | 'sideways_box';
 export type StrategyStatus = 'active' | 'reacted' | 'invalidated' | 'canceled';
 
@@ -310,6 +310,7 @@ class SidewaysBoxDetector {
             if (hasReversalSign) return 'turning_point_base';
         }
         if (len >= 10 && c1 && c2 && c1.isBullish !== c2.isBullish && Indicators.isEngulfing(c1, c2)) return 'breakout_prep_box';
+        if (interval === '1h' && len >= 10 && len <= 40) return 'continuation_box';
         if (interval === '4h' && len >= 5 && len <= 15) return 'continuation_box';
         if (interval === '1d' && len >= 1 && len <= 3) return 'continuation_box';
         return 'unknown';
@@ -976,6 +977,7 @@ export default function App() {
                             <option value="SOLUSDT">SOL/USDT</option>
                         </select>
                         <select value={interval} onChange={(e) => setInterval(e.target.value as CandleInterval)} className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+                            <option value="1h">1 Hour</option>
                             <option value="4h">4 Hours</option>
                             <option value="1d">1 Day</option>
                         </select>
