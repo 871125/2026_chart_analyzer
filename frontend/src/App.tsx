@@ -82,18 +82,21 @@ export default function LiveBotDashboard() {
                     const configRes = await fetch(`http://${window.location.hostname}:8000/config.json`, { cache: "no-store" });
                     if (configRes.ok) {
                         const configData = await configRes.json();
-                        if (configData.timeframe) currentTimeframe = configData.timeframe;
-                        if (configData.symbol) currentSymbol = configData.symbol.replace('-', ''); // BingX(BTC-USDT) -> Binance(BTCUSDT) 포맷 변환
-                        setTimeframe(currentTimeframe);
-                        setSymbol(currentSymbol);
+                        // config.json의 "trading" 하위 객체에서 값을 제대로 가져오도록 수정
+                        if (configData.trading) {
+                            if (configData.trading.box_timeframe) currentTimeframe = configData.trading.box_timeframe;
+                            if (configData.trading.symbol) currentSymbol = configData.trading.symbol.replace('-', '');
+                            setTimeframe(currentTimeframe);
+                            setSymbol(currentSymbol);
+                        }
                     }
                 } catch (e) {
                     console.warn("config.json을 읽어오는데 실패했습니다. 기본값을 사용합니다.");
                 }
             }
 
-            // 2. 현재 시장가 및 차트 데이터 가져오기 (시각화용으로 Binance API 사용 - CORS 이슈 회피)
-            const klinesRes = await fetch(`https://api.binance.com/api/v3/klines?symbol=${currentSymbol}&interval=${currentTimeframe}&limit=100`);
+            // 2. 현재 시장가 및 차트 데이터 가져오기 (limit=1000으로 늘려 과거 Pending Box 생성 시점까지 렌더링 범위 확보)
+            const klinesRes = await fetch(`https://api.binance.com/api/v3/klines?symbol=${currentSymbol}&interval=${currentTimeframe}&limit=1000`);
             const klinesData = await klinesRes.json();
             
             const parsedCandles: Candle[] = klinesData.map((row: any[]) => ({
