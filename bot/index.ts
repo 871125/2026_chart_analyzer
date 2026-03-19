@@ -117,13 +117,19 @@ async function checkMarket() {
                 
                 try {
                     // 6. BingX API를 통해 시장가 진입과 동시에 TP/SL 주문 접수
-                    await placeOrderWithTPSL(botConfig.TRADING_OPTIONS.BINGX_SYMBOL, side, quantity, box.tp, box.sl);
+                    const orderResult = await placeOrderWithTPSL(botConfig.TRADING_OPTIONS.BINGX_SYMBOL, side, quantity, box.tp, box.sl);
+
+                    // BingX API는 잔고 부족/수량 미달 시에도 HTTP 200을 반환하므로 내부 code를 반드시 확인해야 합니다. (보통 0이 성공)
+                    if (orderResult && orderResult.code !== 0) {
+                        throw new Error(`API 응답 에러 (코드: ${orderResult.code}, 메시지: ${orderResult.msg})`);
+                    }
 
                     sendSlackMessage(
                         `✅ [주문 체결 성공] ${side} 포지션 진입!\n` +
                         `진입가격: ${currentPrice}\n` +
                         `설정된 TP: ${box.tp.toFixed(2)} / SL: ${box.sl.toFixed(2)}\n` +
-                        `주문수량: ${quantity}`
+                        `주문수량: ${quantity}\n` +
+                        `주문번호: ${orderResult?.data?.orderId || '확인불가'}`
                     );
                     
                     box.isEntered = true;
@@ -131,6 +137,7 @@ async function checkMarket() {
                     pendingBoxes.splice(i, 1);
                 } catch (e: any) {
                     sendSlackMessage(`❌ [주문 실패] BingX API 오류: ${e.message}`);
+                    console.error("[BingX 주문 에러 상세]:", e);
                 }
             }
         }
