@@ -54,12 +54,23 @@ function getIntervalMs(interval: string): number {
 async function runBot() {
     console.log("🚀 봇 시스템 부팅 완료, 초기화를 시작합니다...");
     await loadState(); // 부팅 시 저장된 상태 복구
-    await sendSlackMessage(
+
+    let bootMessage = (
         `🚀 퀀트 자동 매매 봇 부팅 완료\n` +
         `- 거래 페어: ${botConfig.TRADING_OPTIONS.BINGX_SYMBOL}\n` +
         `- 차트 주기: ${botConfig.TRADING_OPTIONS.INTERVAL}\n` +
-        `- Check 간격: ${botConfig.CHECK_INTERVAL_MS / 1000}초`
+        `- Check 간격: ${botConfig.CHECK_INTERVAL_MS / 1000}초\n` +
+        `=========================\n` +
+        `📋 *[부팅 시 대기 중인 타점: ${pendingBoxes.length}개]*\n`
     );
+
+    if (pendingBoxes.length > 0) {
+        bootMessage += pendingBoxes.map(b => `• ${b.direction.toUpperCase()} | 패턴: ${b.archetype} | EP: ${b.ep.toFixed(2)}`).join('\n');
+    } else {
+        bootMessage += `• 대기 중인 타점이 없습니다.`;
+    }
+    
+    await sendSlackMessage(bootMessage);
 
     // 지정된 주기마다 시장 상태 체크 함수 호출
     setInterval(checkMarket, botConfig.CHECK_INTERVAL_MS);
@@ -103,6 +114,17 @@ async function checkMarket() {
             
             // 과거 데이터(1000개 캔들)에서 발견된 수많은 타점 중 가장 최근의 5개 타점만 필터링
             const recentBoxes = detectedBoxes.slice(-5);
+
+            // 매 주기 박스 연산 완료 시, 최근 생성된 박스 목록을 요약하여 알림
+            let calcMsg = `🔍 *[주기 마감: 차트 분석 완료]*\n` +
+                          `총 ${detectedBoxes.length}개의 타점 감지 (최근 5개 요약)\n` +
+                          `=========================\n`;
+            if (recentBoxes.length > 0) {
+                calcMsg += recentBoxes.map(b => `• ${b.direction.toUpperCase()} | 패턴: ${b.archetype} | EP: ${b.ep.toFixed(2)}`).join('\n');
+            } else {
+                calcMsg += `• 생성된 타점이 없습니다.`;
+            }
+            sendSlackMessage(calcMsg);
 
             // 3. 신규 박스 감지 확인 및 슬랙 전송
             recentBoxes.forEach(box => {
