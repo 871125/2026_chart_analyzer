@@ -18,7 +18,8 @@ async function loadState() {
         if (fs.existsSync(STATE_FILE)) {
             const data = fs.readFileSync(STATE_FILE, 'utf-8');
             const parsed = JSON.parse(data);
-            pendingBoxes = parsed.pendingBoxes || [];
+            // 기존에 너무 많이 저장된 박스가 있다면 스팸 방지를 위해 최근 5개만 로드
+            pendingBoxes = (parsed.pendingBoxes || []).slice(-5);
             activePositions = parsed.activePositions || [];
             lastCalculatedPeriod = parsed.lastCalculatedPeriod || 0;
             console.log(`✅ [상태 복구 완료] 대기 타점: ${pendingBoxes.length}개 / 진입 이력(중복방지): ${activePositions.length}개`);
@@ -99,9 +100,12 @@ async function checkMarket() {
         if (shouldCalcBoxes) {
             const engine = new ChartEngine();
             const detectedBoxes = engine.process(data, botConfig.TRADING_OPTIONS.INTERVAL, botConfig.TRADING_OPTIONS.RR_RATIO);
+            
+            // 과거 데이터(1000개 캔들)에서 발견된 수많은 타점 중 가장 최근의 5개 타점만 필터링
+            const recentBoxes = detectedBoxes.slice(-5);
 
             // 3. 신규 박스 감지 확인 및 슬랙 전송
-            detectedBoxes.forEach(box => {
+            recentBoxes.forEach(box => {
                 const isPending = pendingBoxes.find(b => b.id === box.id);
                 const isActive = activePositions.find(b => b.id === box.id);
 
@@ -109,11 +113,14 @@ async function checkMarket() {
                     pendingBoxes.push(box);
                     stateChanged = true;
                     sendSlackMessage(
-                        `📦 [신규 타점 대기 중] ${box.archetype}\n` +
-                        `방향: ${box.direction.toUpperCase()} \n` +
-                        `진입가(EP): ${box.ep.toFixed(2)}\n` +
-                        `손절가(SL): ${box.sl.toFixed(2)}\n` +
-                        `익절가(TP): ${box.tp.toFixed(2)}`
+                        `=========================\n` +
+                        `📦 *[신규 타점 대기 중]*\n` +
+                        `• 패턴: ${box.archetype}\n` +
+                        `• 방향: ${box.direction.toUpperCase()} \n` +
+                        `• 진입가(EP): ${box.ep.toFixed(2)}\n` +
+                        `• 손절가(SL): ${box.sl.toFixed(2)}\n` +
+                        `• 익절가(TP): ${box.tp.toFixed(2)}\n` +
+                        `=========================`
                     );
                 }
             });
