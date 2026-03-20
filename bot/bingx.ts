@@ -54,3 +54,45 @@ export async function placeOrderWithTPSL(
     
     return response.json();
 }
+
+/**
+ * BingX API를 호출하여 현재 유지 중인 활성 포지션 개수를 반환합니다.
+ */
+export async function getActivePositionsCount(symbol: string): Promise<number> {
+    const timestamp = Date.now().toString();
+    
+    const paramObj: Record<string, string> = {
+        symbol: symbol,
+        timestamp: timestamp
+    };
+
+    // 서명 규칙에 맞게 정렬 및 암호화
+    const sortedKeys = Object.keys(paramObj).sort();
+    const rawQueryString = sortedKeys.map(key => `${key}=${paramObj[key]}`).join('&');
+
+    const signature = crypto.createHmac('sha256', botConfig.BINGX_SECRET_KEY)
+        .update(rawQueryString)
+        .digest('hex');
+
+    const encodedQueryString = sortedKeys.map(key => `${key}=${encodeURIComponent(paramObj[key])}`).join('&');
+    const url = `${BASE_URL}/openApi/swap/v2/user/positions?${encodedQueryString}&signature=${signature}`;
+
+    const response = await fetch(url, {
+        method: 'GET',
+        headers: { 'X-BX-APIKEY': botConfig.BINGX_API_KEY }
+    });
+
+    if (!response.ok) {
+        const errorBody = await response.text();
+        throw new Error(`상태 ${response.status} - ${errorBody}`);
+    }
+
+    const json = await response.json();
+    if (json.code !== 0) {
+        throw new Error(`API 응답 에러 (코드: ${json.code}, 메시지: ${json.msg})`);
+    }
+
+    const positions = Array.isArray(json.data) ? json.data : (json.data?.positions || []);
+    // 수량(positionAmt)의 절댓값이 0보다 큰 활성 포지션만 필터링하여 개수 반환
+    return positions.filter((pos: any) => Math.abs(Number(pos.positionAmt || 0)) > 0).length;
+}

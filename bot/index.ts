@@ -1,6 +1,6 @@
 import { botConfig } from './config';
 import { sendSlackMessage } from './slack';
-import { placeOrderWithTPSL } from './bingx';
+import { placeOrderWithTPSL, getActivePositionsCount } from './bingx';
 import { BinanceAPI, ChartEngine, Box } from './engine';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -21,7 +21,7 @@ async function loadState() {
             pendingBoxes = parsed.pendingBoxes || [];
             activePositions = parsed.activePositions || [];
             lastCalculatedPeriod = parsed.lastCalculatedPeriod || 0;
-            console.log(`✅ [상태 복구 완료] 대기 타점: ${pendingBoxes.length}개 / 유지 포지션: ${activePositions.length}개`);
+            console.log(`✅ [상태 복구 완료] 대기 타점: ${pendingBoxes.length}개 / 진입 이력(중복방지): ${activePositions.length}개`);
         }
     } catch (e) {
         console.error("⚠️ 상태 파일 로드 실패. 빈 상태로 시작합니다.", e);
@@ -122,29 +122,7 @@ async function checkMarket() {
             stateChanged = true;
         }
 
-        // 4. [신규] 현재 보유 중인 포지션 청산(TP/SL) 모니터링 (로컬 배열 비우기)
-        for (let i = activePositions.length - 1; i >= 0; i--) {
-            const pos = activePositions[i];
-            let isClosed = false;
-            let isWin = false;
-
-            // 빙엑스 거래소에는 이미 TP/SL이 걸려있으므로, 로컬에서도 최신 캔들 고/저점 기준으로 청산을 식별합니다.
-            if (pos.direction === 'long') {
-                if (currentCandle.low <= pos.sl) { isClosed = true; isWin = false; }
-                else if (currentCandle.high >= pos.tp) { isClosed = true; isWin = true; }
-            } else {
-                if (currentCandle.high >= pos.sl) { isClosed = true; isWin = false; }
-                else if (currentCandle.low <= pos.tp) { isClosed = true; isWin = true; }
-            }
-
-            if (isClosed) {
-                sendSlackMessage(`🔔 [포지션 종료] ${pos.direction.toUpperCase()} 포지션이 ${isWin ? '익절(TP) 🎯' : '손절(SL) 💥'} 처리되었습니다.\n- 기준 진입가: ${pos.ep.toFixed(2)}`);
-                activePositions.splice(i, 1); // 슬롯 확보
-                stateChanged = true;
-            }
-        }
-
-        // 5. 대기 중인(Pending) 타점의 진입(체결) 조건 달성 여부 확인
+        // 4. 대기 중인(Pending) 타점의 진입(체결) 조건 달성 여부 확인 (TP/SL 청산은 거래소에서 처리)
         for (let i = pendingBoxes.length - 1; i >= 0; i--) {
             const box = pendingBoxes[i];
             
@@ -154,6 +132,8 @@ async function checkMarket() {
             
             if (hitSlBeforeEntry) {
                 sendSlackMessage(`⚠️ [타점 취소] EP 도달 전 SL 먼저 터치됨. 대상 타점: ${box.ep.toFixed(2)}`);
+                activePositions.push(box); // 중복 감지 방지를 위해 이력에 추가
+                if (activePositions.length > 50) activePositions.shift();
                 pendingBoxes.splice(i, 1);
                 stateChanged = true;
                 continue;
@@ -164,8 +144,19 @@ async function checkMarket() {
                                 (box.direction === 'short' && currentCandle.high >= box.ep);
 
             if (shouldEnter) {
-                if (activePositions.length >= botConfig.TRADING_OPTIONS.MAX_POSITIONS) {
-                    sendSlackMessage(`⚠️ [진입 스킵] 현재 유지 중인 포지션이 최대치(${botConfig.TRADING_OPTIONS.MAX_POSITIONS}개)입니다.`);
+                // BingX API로 현재 거래소에 유지 중인 실제 포지션 개수 조회
+                let currentPositionCount = 0;
+                try {
+                    currentPositionCount = await getActivePositionsCount(botConfig.TRADING_OPTIONS.BINGX_SYMBOL);
+                } catch (apiErr: any) {
+                    console.error("[BingX 포지션 개수 조회 실패]:", apiErr.message);
+                    continue; // API 오류 시 안전을 위해 진입을 스킵하고 다음 주기에 재시도
+                }
+
+                if (currentPositionCount >= botConfig.TRADING_OPTIONS.MAX_POSITIONS) {
+                    sendSlackMessage(`⚠️ [진입 스킵] BingX 거래소에 유지 중인 포지션이 최대치(${botConfig.TRADING_OPTIONS.MAX_POSITIONS}개)입니다.`);
+                    activePositions.push(box); // 중복 감지 방지를 위해 이력에 추가
+                    if (activePositions.length > 50) activePositions.shift();
                     pendingBoxes.splice(i, 1);
                     stateChanged = true;
                     continue;
@@ -198,11 +189,16 @@ async function checkMarket() {
                     
                     box.isEntered = true;
                     activePositions.push(box);
+                    if (activePositions.length > 50) activePositions.shift(); // 재진입 방지용 이력 유지 (최대 50개)
                     pendingBoxes.splice(i, 1);
                     stateChanged = true;
                 } catch (e: any) {
-                    sendSlackMessage(`❌ [주문 실패] BingX API 오류: ${e.message}`);
+                    sendSlackMessage(`❌ [주문 실패] BingX API 오류: ${e.message}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)`);
                     console.error("[BingX 주문 에러 상세]:", e);
+                    activePositions.push(box); // 무한 에러 루프 방지를 위해 이력에 추가
+                    if (activePositions.length > 50) activePositions.shift();
+                    pendingBoxes.splice(i, 1); // 에러 발생 시 대기열에서 확실히 제거
+                    stateChanged = true;
                 }
             }
         }
