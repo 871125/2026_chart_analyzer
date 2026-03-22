@@ -1,5 +1,5 @@
 import { botConfig } from './config';
-import { sendSlackMessage } from './slack';
+import { sendTelegramMessage } from './telegram';
 import { placeOrderWithTPSL, getActivePositionsCount } from './bingx';
 import { BinanceAPI, ChartEngine, Box } from './engine';
 import * as fs from 'fs';
@@ -70,7 +70,7 @@ async function runBot() {
         bootMessage += `• 대기 중인 타점이 없습니다.`;
     }
     
-    await sendSlackMessage(bootMessage);
+    await sendTelegramMessage(bootMessage);
 
     // 지정된 주기마다 시장 상태 체크 함수 호출
     setInterval(checkMarket, botConfig.CHECK_INTERVAL_MS);
@@ -124,7 +124,7 @@ async function checkMarket() {
             } else {
                 calcMsg += `• 생성된 타점이 없습니다.`;
             }
-            sendSlackMessage(calcMsg);
+            sendTelegramMessage(calcMsg);
 
             // 3. 신규 박스 감지 확인 및 슬랙 전송
             recentBoxes.forEach(box => {
@@ -134,7 +134,7 @@ async function checkMarket() {
                 if (!isPending && !isActive && box.status === 'active') {
                     pendingBoxes.push(box);
                     stateChanged = true;
-                    sendSlackMessage(
+                    sendTelegramMessage(
                         `=========================\n` +
                         `📦 *[신규 타점 대기 중]*\n` +
                         `• 패턴: ${box.archetype}\n` +
@@ -160,7 +160,7 @@ async function checkMarket() {
                                      (box.direction === 'short' && currentCandle.high >= box.sl);
             
             if (hitSlBeforeEntry) {
-                sendSlackMessage(`⚠️ [타점 취소] EP 도달 전 SL 먼저 터치됨. 대상 타점: ${box.ep.toFixed(2)}`);
+                sendTelegramMessage(`⚠️ [타점 취소] EP 도달 전 SL 먼저 터치됨. 대상 타점: ${box.ep.toFixed(2)}`);
                 activePositions.push(box); // 중복 감지 방지를 위해 이력에 추가
                 if (activePositions.length > 50) activePositions.shift();
                 pendingBoxes.splice(i, 1);
@@ -183,7 +183,7 @@ async function checkMarket() {
                 }
 
                 if (currentPositionCount >= botConfig.TRADING_OPTIONS.MAX_POSITIONS) {
-                    sendSlackMessage(`⚠️ [진입 스킵] BingX 거래소에 유지 중인 포지션이 최대치(${botConfig.TRADING_OPTIONS.MAX_POSITIONS}개)입니다.`);
+                    sendTelegramMessage(`⚠️ [진입 스킵] BingX 거래소에 유지 중인 포지션이 최대치(${botConfig.TRADING_OPTIONS.MAX_POSITIONS}개)입니다.`);
                     activePositions.push(box); // 중복 감지 방지를 위해 이력에 추가
                     if (activePositions.length > 50) activePositions.shift();
                     pendingBoxes.splice(i, 1);
@@ -208,7 +208,7 @@ async function checkMarket() {
                         throw new Error(`API 응답 에러 (코드: ${orderResult.code}, 메시지: ${orderResult.msg})`);
                     }
 
-                    sendSlackMessage(
+                    sendTelegramMessage(
                         `✅ [주문 체결 성공] ${side} 포지션 진입!\n` +
                         `진입가격: ${currentPrice}\n` +
                         `설정된 TP: ${box.tp.toFixed(2)} / SL: ${box.sl.toFixed(2)}\n` +
@@ -222,7 +222,7 @@ async function checkMarket() {
                     pendingBoxes.splice(i, 1);
                     stateChanged = true;
                 } catch (e: any) {
-                    sendSlackMessage(`❌ [주문 실패] BingX API 오류: ${e.message}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)`);
+                    sendTelegramMessage(`❌ [주문 실패] BingX API 오류: ${e.message}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)`);
                     console.error("[BingX 주문 에러 상세]:", e);
                     activePositions.push(box); // 무한 에러 루프 방지를 위해 이력에 추가
                     if (activePositions.length > 50) activePositions.shift();
