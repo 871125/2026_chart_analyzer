@@ -112,40 +112,27 @@ async function checkMarket() {
             const engine = new ChartEngine();
             const detectedBoxes = engine.process(data, botConfig.TRADING_OPTIONS.INTERVAL, botConfig.TRADING_OPTIONS.RR_RATIO);
             
-            // 과거 데이터(1000개 캔들)에서 발견된 수많은 타점 중 가장 최근의 5개 타점만 필터링
-            const recentBoxes = detectedBoxes.slice(-5);
-
-            // 매 주기 박스 연산 완료 시, 최근 생성된 박스 목록을 요약하여 알림
-            let calcMsg = `🔍 *[주기 마감: 차트 분석 완료]*\n` +
-                          `총 ${detectedBoxes.length}개의 타점 감지 (최근 5개 요약)\n` +
-                          `=========================\n`;
-            if (recentBoxes.length > 0) {
-                calcMsg += recentBoxes.map(b => `• ${b.direction.toUpperCase()} | 패턴: ${b.archetype} | EP: ${b.ep.toFixed(2)}`).join('\n');
-            } else {
-                calcMsg += `• 생성된 타점이 없습니다.`;
-            }
-            sendTelegramMessage(calcMsg);
-
-            // 3. 신규 박스 감지 확인 및 슬랙 전송
-            recentBoxes.forEach(box => {
+            // 3. 엔진이 찾은 타점 중 이미 진입/취소 처리된 이력(activePositions)이 없고, 
+            // 대기열(pendingBoxes)에도 없는 '완전 신규' Pending 타점만 추출
+            const newPendingBoxes = detectedBoxes.filter(box => {
                 const isPending = pendingBoxes.find(b => b.id === box.id);
                 const isActive = activePositions.find(b => b.id === box.id);
+                return !isPending && !isActive && box.status === 'active';
+            }).slice(-5); // 혹시 모를 대량 알람 방지를 위해 최대 5개까지만 허용
 
-                if (!isPending && !isActive && box.status === 'active') {
+            // 주기 마감 시 신규 타점이 없더라도 분석 완료 알림 전송 (생존 신고)
+            let alertMsg = `🔍 *[주기 마감: 차트 분석 완료]*\n`;
+            if (newPendingBoxes.length > 0) {
+                alertMsg += `새로운 대기 타점(Pending) ${newPendingBoxes.length}개 감지\n=========================\n`;
+                newPendingBoxes.forEach(box => {
                     pendingBoxes.push(box);
-                    stateChanged = true;
-                    sendTelegramMessage(
-                        `=========================\n` +
-                        `📦 *[신규 타점 대기 중]*\n` +
-                        `• 패턴: ${box.archetype}\n` +
-                        `• 방향: ${box.direction.toUpperCase()} \n` +
-                        `• 진입가(EP): ${box.ep.toFixed(2)}\n` +
-                        `• 손절가(SL): ${box.sl.toFixed(2)}\n` +
-                        `• 익절가(TP): ${box.tp.toFixed(2)}\n` +
-                        `=========================`
-                    );
-                }
-            });
+                    alertMsg += `📦 *[신규 타점 대기 중]*\n• 패턴: ${box.archetype}\n• 방향: ${box.direction.toUpperCase()} \n• 진입가(EP): ${box.ep.toFixed(2)}\n• 손절가(SL): ${box.sl.toFixed(2)}\n• 익절가(TP): ${box.tp.toFixed(2)}\n=========================\n`;
+                });
+            } else {
+                alertMsg += `새로운 대기 타점이 없습니다.\n(현재 대기 중인 타점 유지: ${pendingBoxes.length}개)\n=========================\n`;
+            }
+            
+            sendTelegramMessage(alertMsg);
             
             lastCalculatedPeriod = currentPeriod; // 타점 계산 주기 갱신
             stateChanged = true;
