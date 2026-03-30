@@ -97,7 +97,9 @@ async function checkMarket() {
         const { data, isMock } = await BinanceAPI.fetchKlines(
             botConfig.TRADING_OPTIONS.BINANCE_SYMBOL, 
             botConfig.TRADING_OPTIONS.INTERVAL, 
-            undefined, // START_DATE부터 가져오는 페이징 부하 제거 
+            shouldCalcBoxes && (botConfig.TRADING_OPTIONS as any).START_DATE 
+                ? new Date((botConfig.TRADING_OPTIONS as any).START_DATE).getTime() 
+                : undefined, // 바이낸스 API 규격(밀리초 타임스탬프)에 맞게 Date 객체로 변환하여 전달
             undefined, 
             shouldCalcBoxes ? 1000 : 2
         );

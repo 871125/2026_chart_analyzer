@@ -18,6 +18,10 @@ export async function placeOrderWithTPSL(
     const oppositeSide = side === 'BUY' ? 'SELL' : 'BUY';
     const positionSide = side === 'BUY' ? 'LONG' : 'SHORT';
     
+    // 바이낸스 Price Filter(-1111) 에러 방지를 위해 가격 소수점 절사 (BTC/ETH 등 주요 페어는 소수점 2자리가 안전)
+    const tpPriceStr = takeProfit.toFixed(2);
+    const slPriceStr = stopLoss.toFixed(2);
+    
     const orders = [
         {
             symbol: symbol,
@@ -31,7 +35,7 @@ export async function placeOrderWithTPSL(
             side: oppositeSide,
             positionSide: positionSide,
             type: 'TAKE_PROFIT_MARKET',
-            stopPrice: takeProfit.toString(),
+            stopPrice: tpPriceStr,
             closePosition: "true"
         },
         {
@@ -39,7 +43,7 @@ export async function placeOrderWithTPSL(
             side: oppositeSide,
             positionSide: positionSide,
             type: 'STOP_MARKET',
-            stopPrice: stopLoss.toString(),
+            stopPrice: slPriceStr,
             closePosition: "true"
         }
     ];
@@ -68,13 +72,19 @@ export async function placeOrderWithTPSL(
     
     const json = await response.json();
     
-    // batchOrders는 배열로 응답을 반환하므로 첫 번째 주문(진입)의 결과를 주로 확인합니다.
-    const entryResult = Array.isArray(json) ? json[0] : json;
-    if (entryResult.code && entryResult.code < 0) {
-         throw new Error(`API 응답 에러 (코드: ${entryResult.code}, 메시지: ${entryResult.msg})`);
+    // batchOrders는 배열로 응답을 반환합니다. 진입/TP/SL 중 하나라도 실패했는지 전체를 엄격하게 검사합니다.
+    if (Array.isArray(json)) {
+        for (const result of json) {
+            if (result.code && result.code < 0) {
+                throw new Error(`Batch 주문 실패 (코드: ${result.code}, 메시지: ${result.msg})`);
+            }
+        }
+    } else if (json.code && json.code < 0) {
+        throw new Error(`API 응답 에러 (코드: ${json.code}, 메시지: ${json.msg})`);
     }
     
     // index.ts 코드와의 호환성을 위해 code 0을 반환하도록 래핑
+    const entryResult = Array.isArray(json) ? json[0] : json;
     return { code: 0, data: { orderId: entryResult.orderId }, msg: "success", raw: json };
 }
 
