@@ -186,7 +186,18 @@ async function checkMarket() {
                 const riskAmount = botConfig.TRADING_OPTIONS.CAPITAL * (botConfig.TRADING_OPTIONS.RISK_PER_TRADE / 100);
                 const slPercent = Math.max(Math.abs(box.ep - box.sl) / box.ep, 0.0001); // 손절폭 비율
                 const idealPosSizeUsd = riskAmount / slPercent; // 총 투입 포지션 규모 (USD)
-                const quantity = Number((idealPosSizeUsd / currentPrice).toFixed(4)); // 실제 코인 수량 (거래소 규격에 맞게 소수점 4자리 절사)
+
+                // [안전장치] 계산된 포지션 규모가 바이낸스 최소 주문 금액(Notional)보다 작은지 사전 확인
+                if (idealPosSizeUsd < 100) {
+                    sendTelegramMessage(`⚠️ [진입 스킵] 계산된 포지션 규모(${idealPosSizeUsd.toFixed(2)} USDT)가 바이낸스 최소 주문 금액(100 USDT)보다 작습니다.\n\n*이 값은 레버리지를 포함한 총 거래 규모이며, 실제 투입 증거금이 아닙니다.*`);
+                    activePositions.push(box); // 중복 감지 방지를 위해 이력에 추가
+                    if (activePositions.length > 50) activePositions.shift();
+                    pendingBoxes.splice(i, 1);
+                    stateChanged = true;
+                    continue; // 다음 타점으로 넘어감
+                }
+
+                const quantity = Number((idealPosSizeUsd / currentPrice).toFixed(3)); // 실제 코인 수량 (BTCUSDT 기준, 허용 소수점 3자리로 수정)
                 
                 try {
                     // 6. Binance API를 통해 시장가 진입과 동시에 TP/SL 주문 접수
