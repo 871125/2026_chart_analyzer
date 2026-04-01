@@ -1,7 +1,7 @@
 import { botConfig } from './config';
 import { sendTelegramMessage } from './telegram';
 import { placeOrderWithTPSL, getActivePositionsCount } from './bingx';
-import { BinanceAPI, ChartEngine, Box } from './engine';
+import { BingXAPI, ChartEngine, Box } from './engine';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -92,10 +92,10 @@ async function checkMarket() {
         // 정해진 INTERVAL 주기(정각)가 변경되었거나 최초 실행인 경우에만 박스(타점) 재계산
         const shouldCalcBoxes = currentPeriod > lastCalculatedPeriod;
 
-        // 1. Binance로부터 OHLCV 최신 데이터 갱신
+        // 1. BingX로부터 OHLCV 최신 데이터 갱신
         // 박스 계산 주기에는 1000개를 로드하고, 평상시 진입/청산 확인용으로는 부하를 줄이기 위해 최근 2개 캔들만 로드합니다.
-        const { data, isMock } = await BinanceAPI.fetchKlines(
-            botConfig.TRADING_OPTIONS.BINANCE_SYMBOL, 
+        const { data, isMock } = await BingXAPI.fetchKlines(
+            botConfig.TRADING_OPTIONS.BINGX_SYMBOL, 
             botConfig.TRADING_OPTIONS.INTERVAL, 
             undefined, // START_DATE부터 가져오는 페이징 부하 제거 
             undefined, 

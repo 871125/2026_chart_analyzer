@@ -1,187 +1,64 @@
-# Quantitative Chart Analyzer - 프로젝트 문서
+# 📈 Quantitative Chart Analyzer & Trading Bot
 
-본 문서는 Binance API를 활용하여 시장 데이터를 수집하고, 횡보 박스(Sideways Box) 전략을 기반으로 매매 타점을 분석 및 백테스트하는 **고급 정량적 차트 분석기 대시보드** 에 대한 상세 안내서입니다.
+이 프로젝트는 **BingX 무기한 선물(Perpetual Futures) API**를 활용하여 차트의 '횡보 박스권(Sideways Box)' 돌파 전략을 시각적으로 백테스트하고, 실제 자동 매매까지 수행하는 종합 퀀트 트레이딩 시스템입니다.
 
-## 1. 핵심 아키텍처 및 기능 설명
+## ✨ 주요 기능 (Features)
 
-이 애플리케이션은 크게 **[코어 엔진]**과 **[리액트 뷰(UI)]** 두 부분으로 나뉘며, 실제 트레이딩 환경과 동일한 **시계열 기반 백테스트 시뮬레이터(Chronological Backtester)**를 탑재하고 있습니다.
+1. **React 기반 백테스트 시뮬레이터 (`/chart-analyzer`)**
+   * **BingX Live Data**: 실시간 BingX 캔들 데이터를 불러와 차트에 렌더링합니다.
+   * **시계열 백테스트 엔진**: 지정된 기간의 과거 데이터를 기반으로 횡보 박스를 탐지하고 가상의 포지션(롱/숏) 진입 및 청산을 시뮬레이션합니다.
+   * **자금 관리(Money Management)**: 초기 자본금, 리스크(%), 레버리지, 최대 동시 진입 포지션 수를 설정하여 PnL 및 계좌 잔고(MDD)의 변화를 시각적으로 확인합니다.
 
-### 1.1. 코어 엔진 로직 (Core Engine)
+2. **Node.js 자동 매매 봇 (`/bot`)**
+   * **100% 자동화**: 설정된 차트 주기(예: 1h, 4h)마다 정각에 차트를 분석하여 신규 타점을 발굴합니다.
+   * **BingX API 연동**: 타점 도달 시 지정된 리스크 비율에 맞춰 진입 수량을 자동 계산하고, 시장가 진입과 동시에 TP(익절) / SL(손절) 주문을 전송합니다.
+   * **텔레그램 알림(Telegram Bot)**: 봇 부팅, 신규 타점 탐지, 진입(체결) 성공/실패, 타점 무효화 등의 핵심 이벤트를 실시간으로 메신저로 전송합니다.
+   * **상태 복구(State Recovery)**: 봇이 예기치 않게 종료되더라도 `state.json`을 통해 대기 중인 타점을 기억하고 복구합니다.
 
-시장 데이터를 분석하여 의미 있는 매매 타점(Zone)을 찾아내고, 상태를 추적하는 로직입니다.
+## 🚀 설치 및 실행 방법 (Getting Started)
 
-- **`BinanceAPI` 클래스**
+### 1. 환경 변수 설정 (`.env`)
+봇 구동을 위해 루트 디렉토리에 `.env` 파일을 생성하고 아래 정보를 입력하세요.
+```env
+# BingX API Keys
+BINGX_API_KEY=your_bingx_api_key_here
+BINGX_API_SECRET=your_bingx_api_secret_here
 
-  - **역할:** 바이낸스 REST API(`/api/v3/klines`)를 호출하여 OHLCV 캔들 데이터를 가져옵니다.
-  - **특징:** 최대 조회 제한(1,000개)을 극복하기 위해 `while` 루프를 사용한 **Pagination(페이지네이션)** 로직이 구현되어 있습니다. API Rate Limit 보호를 위해 지연(50ms)을 주며, 네트워크 오류 시 내장된 `Mock Data` 를 반환하는 Fallback 기능이 있습니다.
-- **`Indicators` 클래스**
-
-  - **역할:** RSI (Wilder's Smoothing), Regular Divergence(일반 다이버전스), 거래량 확장(Volume Expansion), 핀바(Pinbar) 및 장악형(Engulfing) 캔들 패턴 인식을 담당합니다.
-- **`SidewaysBoxDetector` 클래스**
-
-  - **역할:** 핵심 매매 전략인 '횡보 박스'를 감지합니다.
-  - **로직:** 1. 캔들을 순회하며 박스의 상/하단(High/Low) 경계를 정의하고 돌파(Breakout)를 감지합니다.
-2. 돌파 후 3캔들 동안 박스 내부 오더블록(OB)으로 재진입하지 않는지 유효성을 검사합니다.
-3. 추세 지속형, 돌파 준비형, 변곡점 등 **아키타입(Archetype)**을 분류합니다.
-4. 지표를 기반으로 점수(Score)를 매겨 기준점(70점) 이상인 타점만 필터링하고 R:R(Risk to Reward) 비율에 따라 EP, SL, TP를 계산합니다.
-- **`ChartEngine` & 시계열 시뮬레이터**
-
-  - **역할:** 미래 데이터를 참조하지 않고(Look-ahead bias 제거) 시간순으로 캔들을 순회하며 실시간 계좌 상태를 시뮬레이션합니다.
-  - **주요 기능:**
-
-    - **다중 포지션 제어 (`Max Pos`):** 설정한 최대 포지션 수를 초과하면 신규 타점을 취소(`Canceled: Max Pos`)합니다.
-    - **레버리지 및 증거금 (`Margin`):** 고정 리스크(Fixed Fractional) 모델을 적용하여 필요한 총 진입 규모(`Pos`)를 구하고, 이를 레버리지로 나눈 실제 필요 증거금(`Margin`)을 계산합니다. 잔여 증거금이 부족하면 진입을 취소(`Canceled: No Margin`)합니다.
-    - **논리적 오류 방지:** EP(진입가)에 도달하기 전에 SL(손절가)을 먼저 터치한 차트 붕괴 타점은 안전하게 진입을 취소(`Canceled: SL Hit First`)합니다.
-
-### 1.2. 리액트 뷰 (React UI)
-
-코어 엔진의 분석 결과를 시각화하고 사용자와 상호작용하는 프론트엔드 파트입니다.
-
-- **동기화된 3중 Canvas 렌더링**
-
-  - **Main Chart:** 캔들스틱, 횡보 박스, 박스 연장선, 진입(▲/▼) 및 청산(원형) 마커를 렌더링합니다. 취소된 박스는 흐린 점선으로 구분합니다.
-  - **PNL Curve:** 누적 손익비(R 단위)의 변화를 그립니다.
-  - **Equity Curve:** 초기 자본과 리스크(%) 기반의 복리 자산 변동($)을 그립니다.
-  - *특징:* 마우스 휠(Zoom)과 드래그(Pan) 조작 시 세 차트의 X축(시간)이 완벽하게 동기화되어 움직입니다.
-- **백테스팅 통계 및 데이터 테이블**
-
-  - 차트 우측 상단에 실시간 **승률(Win Rate)**과 **최대 낙폭(MDD)**을 표시합니다.
-  - 데이터 테이블에서는 각 거래의 상태(대기/진입/익절/손절/취소), **Invested (총 진입 규모 및 증거금)**, 자산 대비 손익률(%) 등을 상세히 확인할 수 있습니다.
-
-## 2. 사용 및 설치 방법
-
-본 프로젝트는 최신 React 및 Tailwind CSS(v3) 환경에서 동작하도록 설계되었습니다.
-
-### 2.1. 프로젝트 셋업
-
-터미널을 열고 아래 명령어들을 차례대로 실행합니다.
-
+# Telegram Bot Setup
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+TELEGRAM_CHAT_ID=your_telegram_chat_id_here
 ```
-# 1. Vite를 사용하여 React + TypeScript 프로젝트 생성
-npm create vite@latest chart-analyzer -- --template react-ts
 
-# 2. 생성된 폴더로 이동 및 패키지 설치
+### 2. 패키지 설치
+```bash
+# 백테스트 웹 UI 패키지 설치
 cd chart-analyzer
 npm install
-npm install lucide-react
 
-# 3. Tailwind CSS(v3) 및 PostCSS 설치 (v4 에러 방지)
-npm install -D tailwindcss@3 postcss autoprefixer
-
-# 4. Tailwind 설정 파일 초기화
-npx tailwindcss init -p
+# 트레이딩 봇 패키지 설치
+cd ../bot
+npm install
 ```
 
-### 2.2. 코드 덮어쓰기 및 설정
+### 3. 애플리케이션 실행
 
-1. **Tailwind 설정:** `tailwind.config.js` 파일을 열고 아래 내용으로 교체합니다.
-
+**웹 UI (백테스트 시뮬레이터) 실행**
+```bash
+cd chart-analyzer
+npm start
 ```
-/** @type {import('tailwindcss').Config} */
-export default {
-  content: [
-    "./index.html",
-    "./src/**/*.{js,ts,jsx,tsx}",
-  ],
-  theme: {
-    extend: {},
-  },
-  plugins: [],
-}
+* 브라우저에서 `http://localhost:3000`으로 접속하여 차트를 확인합니다.
+
+**트레이딩 봇 (실전 자동 매매) 실행**
+```bash
+cd bot
+npm run start
+# 또는 ts-node index.ts
 ```
+* 봇이 부팅되면 텔레그램으로 부팅 성공 메시지와 대기 중인 타점 리스트가 전송됩니다.
 
-1. **CSS 설정:** `src/index.css` 파일의 모든 내용을 지우고 아래 내용을 입력합니다.
-
-```
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-```
-
-1. **앱 코드 적용:** 완성된 `ChartAnalyzerView.tsx` 파일의 전체 코드를 복사한 뒤, 로컬 프로젝트의 `src/App.tsx` 파일 내용을 모두 지우고 붙여넣습니다.
-
-### 2.3. 앱 실행
-
-```
-npm run dev
-```
-브라우저에서 `http://localhost:5173` 에 접속하여 분석기 대시보드를 사용할 수 있습니다.
-
-## 3. 프롬프트 업데이트 문서화 (Prompt History)
-
-해당 코드를 처음부터 완성하기까지 사용된 논리적 지시(Prompt) 과정입니다.
-
-### 단계 1: 코어 엔진 설계 및 API 연동
-
-> "퀀트 차트 분석기 엔진의 TypeScript 코드를 작성해 줘. 바이낸스 API(/api/v3/klines)를 연동하여 OHLCV 데이터를 가져오고, 'sideways_box(횡보 박스)'라는 새로운 매매 패턴을 감지하는 로직을 구현해. 아키타입(Continuation, Breakout Prep, Turning Point)을 분류하고, 지표(RSI/다이버전스/거래량) 점수 70점 이상만 통과시켜. R:R(1:2) 비율 기반으로 EP, SL, TP를 계산해 줘."
-
-### 단계 2: React 기반 시각화 대시보드 UI 구현
-
-> "이전 코어 엔진을 시각적으로 보여주는 React 대시보드 컴포넌트를 만들어. HTML5 Canvas를 이용해 캔들스틱과 횡보 박스를 그리고, API 실패 시 내장된 Mock 데이터를 사용해 UI가 무조건 렌더링되게 해. 검출된 데이터는 테이블에 리스트업해 줘."
-
-### 단계 3: 기간 설정, 페이징 및 누적 수익률(PNL) 차트
-
-> "UI에 기간 설정 Date Picker를 추가해. API가 한 번에 1,000개만 가져오므로, 지정한 기간을 모두 조회할 때까지 `while` 문으로 Pagination을 수행해. 메인 차트 아래에 X축이 동기화된 누적 수익률(PNL Curve) 차트를 추가해 줘."
-
-### 단계 4: 차트 Pan/Zoom 동기화 및 복리 자산(Equity) 시뮬레이션
-
-> "마우스 휠로 Zoom-in/out, 드래그로 Pan 이동이 가능하게 만들어. 3개의 차트(Main, PNL, Equity)의 X축이 완벽히 동기화되게 해 줘. 초기 자본금과 리스크 비율(%)을 입력받아, 고정 리스크 포지션 사이징(Fixed Fractional)을 수행하는 Equity Curve 차트를 추가해 줘."
-
-### 단계 5: 체결 논리 수정 및 차트 UI 디테일 폴리싱
-
-> "가격이 EP(진입가)에 도달하여 '체결(Filled)'된 이후에만 TP/SL을 판단하도록 로직을 수정해. 박스 연장선은 청산 시점까지만 점선으로 그리고, 진입/청산 캔들에 매칭되는 식별 번호 마커(▲/▼, 원형)를 그려 줘."
-
-### 단계 6: 시계열 백테스트 및 레버리지/마진 관리 (최종)
-
-> "엔진을 시계열 기반으로 전면 개편해. 1. 최대 동시 유지 포지션 개수(Max Pos)를 제한해. 2. 레버리지(Leverage)를 설정받아, 진입 규모(Pos) 대비 실제 투입되는 증거금(Margin)을 계산하고 잔고 부족 시 진입을 취소해. 3. EP 도달 전 SL을 먼저 터치한 타점은 취소해. 각 취소 사유를 표에 명시하고, 전체 승률(Win Rate)과 MDD를 우측 상단에 표시해 줘."
-
-## 4. 자동 매매 봇 (Automated Trading Bot) 안내
-
-충분한 백테스팅 검증이 완료된 코어 엔진을 바탕으로, 실제 매매를 수행하는 Node.js 기반 자동 매매 봇이 `chart-analyzer/bot` 디렉토리 내에 추가되었습니다.
-
-### 4.1. 주요 기능
-- **데이터 수집:** 바이낸스(Binance) API를 사용하여 최신 OHLCV 시계열 데이터를 주기적으로 폴링합니다.
-- **주문 실행:** 타점(EP) 도달 조건 만족 시, 빙엑스(BingX) 거래소 무기한 선물 API를 활용해 **진입 주문(Market)과 동시에 익절(TP), 손절(SL) 주문을 세팅**합니다.
-- **Telegram 알림:** 새로운 횡보 박스(타점) 생성, 진입 취소(SL 선도달/포지션 초과), 진입 성공 등 봇의 모든 상태 변화를 텔레그램 메신저로 실시간 전송합니다.
-- **설정 중앙화:** `bot/config.ts` 파일에서 주문 간격, API Key, 최대 보유 포지션 수, RR 비율, 레버리지, 데이터 스캔 시작일, **운용 자산 대비 리스크(%) 기반 동적 포지션 사이징** 등을 통합 관리합니다.
-
-### 4.2. 봇 구동 핵심 로직 (Core Logic & Algorithms)
-
-1. **UTC 정각 동기화 (Time Alignment)**
-   - 봇을 언제 실행하더라도 현재 시간을 주기(`INTERVAL`)로 나눈 수학적 계산(`Math.floor(now / intervalMs)`)을 통해, 거래소의 실제 캔들 마감 시점(예: KST 09:00, 13:00 등)을 정확히 추적합니다. **새로운 캔들이 확정되는 정각에 단 한 번만** 무거운 타점 연산을 수행합니다.
-2. **이원화된 폴링 시스템 (API 부하 및 리소스 최적화)**
-   - **캔들 마감 정각:** 과거 1,000개의 캔들을 로드하여 차트 패턴 알고리즘(엔진)을 구동, 새로운 타점(`pendingBoxes`)을 식별합니다. (수수한 타점 중 가장 최신 트렌드를 반영하는 최근 5개만 필터링)
-   - **평상시 모니터링:** 5초(설정값)마다 **최근 2개의 캔들만 로드**하여 꼬리(High/Low)가 진입가(EP)를 터치했는지만 아주 가볍게 확인합니다.
-3. **동적 포지션 사이징 (Dynamic Risk Management)**
-   - 고정 수량 진입이 아닌, **운용 자금(CAPITAL)**과 **1회 감수 리스크 비율(RISK_PER_TRADE)**을 기반으로 타점의 손절폭(SL%)을 역산합니다. 타점의 SL 거리가 멀면 적은 수량을, 가까우면 많은 수량을 매수하여 **어떤 거래에서 손절이 나더라도 계좌의 손실 금액을 항상 일정하게 유지**하는 프로 트레이더의 자금 관리 로직이 탑재되어 있습니다.
-4. **안전한 진입 제어 및 중복 방지 (State Persistence)**
-   - 진입가 도달 시 무지성으로 주문을 넣는 대신, **BingX API를 호출해 실제 거래소에 유지 중인 활성 포지션 개수를 확인**하여 설정된 `MAX_POSITIONS` 초과 여부를 철저히 검증합니다.
-   - 한 번 진입했거나, EP 도달 전 SL을 먼저 터치해 차트가 붕괴되었거나, 에러가 발생한 타점은 대기열에서 곧바로 삭제되고 **`activePositions`(진입 이력 및 블랙리스트)로 이관**됩니다. 이후 `state.json`에 실시간으로 백업되므로, 봇을 재부팅해도 폐기된 타점에 다시 중복 진입하는 치명적 오류를 완벽히 차단합니다.
-
-### 4.3. 실행 및 셋업 방법
-
-1. **Node.js 서버 구동 환경 구성 (`tsx` 추천)**
-   최신 Node.js 환경에서 TypeScript 파일을 직접 실행하기 위해 전역으로 `tsx`를 설치합니다.
-   ```bash
-   npm install -g tsx
-   ```
-2. **환경변수 및 설정 입력**
-   `chart-analyzer/bot/config.ts` 파일을 열어 다음 항목들을 환경에 맞게 기입합니다.
-   - `BINGX_API_KEY`: 빙엑스 API 키
-   - `BINGX_SECRET_KEY`: 빙엑스 시크릿 키
-   - `TELEGRAM_BOT_TOKEN`: 텔레그램 BotFather에게 발급받은 봇 토큰
-   - `TELEGRAM_CHAT_ID`: 메시지를 수신할 텔레그램 채팅방(Chat ID)
-
-3. **봇 실행**
-   터미널에서 봇 디렉토리로 이동하지 않고 루트 디렉토리에서 바로 실행합니다.
-   ```bash
-   cd chart-analyzer
-   tsx bot/index.ts
-   ```
-
-### 4.4. 업데이트 내역
-- **[신규] Telegram 마이그레이션:** 기존 Slack Webhook 방식에서 Telegram Bot API 방식으로 알림 모듈을 교체하여 모바일 접근성과 편의성을 높였습니다.
-- **[신규] 동적 포지션 사이징 적용:** 고정된 수량으로 주문하던 방식에서 벗어나, `config.ts`에 설정된 운용 자산(`CAPITAL`)과 1회 감수 리스크 비율(`RISK_PER_TRADE`)을 바탕으로 손절폭(SL%)을 자동으로 역산하여 **진입 수량(Quantity)을 동적으로 산출**하는 로직으로 고도화되었습니다. 이를 통해 잦은 손절에도 계좌 파산을 안전하게 방어합니다.
-- **[최적화] UTC 정각 동기화 및 타점 연산 분리:** 봇을 언제 실행하더라도 거래소의 캔들 마감 시간(정각)을 수학적으로 추적하여 정확히 캔들이 확정되는 시점에만 무거운 차트 패턴 분석(1000개 캔들 로드)을 수행합니다. 평상시 진입/청산 모니터링은 최소 캔들(최근 2개)만 로드하여 CPU와 API Rate Limit 부하를 혁신적으로 줄였습니다.
-- **[안정성] BingX API 서명(Signature) 알고리즘 개선:** 특수문자 JSON 파라미터가 포함된 복합 주문 시 발생하는 `100001` 서명 불일치 에러를 방지하기 위해, 파라미터 사전 정렬(Alphabetical Sort) 및 Raw String 암호화 로직을 도입하여 거래소 주문 체결의 안정성을 극대화했습니다.
-- **[지속성(Persistence)] 상태 저장 및 복구 로직 도입:** 봇이 재시작되거나 에러로 인해 종료된 후 다시 실행될 때, 기존의 대기 중인 타점(`pendingBoxes`)과 유지 중인 포지션(`activePositions`) 정보가 날아가지 않도록 로컬의 `state.json` 파일에 실시간으로 상태를 백업하고 자동 복구하는 기능이 추가되었습니다.
+## ⚠️ 주의사항 (Disclaimer)
+* 본 시스템은 학습 및 연구 목적으로 제작되었습니다.
+* 알고리즘 트레이딩은 원금 손실의 위험이 매우 높으므로, 반드시 **BingX 모의투자(Demo) 환경**이나 소액으로 충분한 검증을 거친 후 사용하시기 바랍니다.
+* 레버리지 설정 및 리스크(Risk Per Trade) 관리에 각별히 주의하세요. 
+* 예기치 않은 API 통신 장애나 거래소 점검 시 봇이 정상 작동하지 않을 수 있습니다.

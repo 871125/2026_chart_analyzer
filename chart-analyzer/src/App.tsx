@@ -68,8 +68,22 @@ export interface Box extends Zone {
     skipReason?: 'max_positions' | 'no_margin' | 'sl_before_ep'; // 진입 취소 사유
 }
 
-class BinanceAPI {
-    private static readonly BASE_URL = 'https://api.binance.com/api/v3';
+function parseIntervalToMs(interval: string): number {
+    const unit = interval.slice(-1);
+    const value = parseInt(interval.slice(0, -1));
+    switch (unit) {
+        case 'm': return value * 60 * 1000;
+        case 'h': return value * 60 * 60 * 1000;
+        case 'd': return value * 24 * 60 * 60 * 1000;
+        case 'w': return value * 7 * 24 * 60 * 60 * 1000;
+        default: return 15 * 60 * 1000;
+    }
+}
+
+class BingXAPI {
+    private static readonly BASE_URL = 'https://open-api.bingx.com';
+    // 브라우저 CORS 에러 방지를 위한 퍼블릭 프록시 (allorigins.win raw 모드)
+    private static readonly CORS_PROXY = 'https://api.allorigins.win/raw?url=';
 
     static async fetchKlines(symbol: string, interval: CandleInterval, startTime?: number, endTime?: number, limit = 1000): Promise<{data: Candle[], isMock: boolean}> {
         let allCandles: Candle[] = [];
@@ -79,28 +93,38 @@ class BinanceAPI {
         
         try {
             while (fetchCount < MAX_FETCHES) {
-                let url = `${this.BASE_URL}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-                if (currentStartTime) url += `&startTime=${currentStartTime}`;
-                if (endTime) url += `&endTime=${endTime}`;
+                let targetUrl = `${this.BASE_URL}/openApi/swap/v3/quote/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+                if (currentStartTime) targetUrl += `&startTime=${currentStartTime}`;
+                if (endTime) targetUrl += `&endTime=${endTime}`;
                 
-                const response = await fetch(url);
-                if (!response.ok) throw new Error(`Binance API error: ${response.statusText}`);
+                // CORS 우회 프록시 적용
+                const response = await fetch(`${this.CORS_PROXY}${encodeURIComponent(targetUrl)}`);
+                if (!response.ok) throw new Error(`BingX API error: ${response.statusText}`);
                 
-                const rawData: any[][] = await response.json();
+                const json = await response.json();
+                if (json.code !== 0) throw new Error(`BingX API error code ${json.code}: ${json.msg}`);
                 
+                const rawData: any[] = json.data || [];
                 if (rawData.length === 0) break; 
                 
+                rawData.sort((a, b) => Number(a.time) - Number(b.time));
+                
                 const data = rawData.map(row => {
-                    const open = parseFloat(row[1]);
-                    const close = parseFloat(row[4]);
+                    const open = parseFloat(row.open);
+                    const close = parseFloat(row.close);
+                    const high = parseFloat(row.high);
+                    const low = parseFloat(row.low);
+                    const volume = parseFloat(row.volume || row.vol || 0);
+                    const openTime = Number(row.time);
+                    const closeTime = openTime + parseIntervalToMs(interval) - 1;
                     return {
-                        openTime: row[0],
+                        openTime,
                         open,
-                        high: parseFloat(row[2]),
-                        low: parseFloat(row[3]),
+                        high,
+                        low,
                         close,
-                        volume: parseFloat(row[5]),
-                        closeTime: row[6],
+                        volume,
+                        closeTime,
                         isBullish: close >= open
                     };
                 });
@@ -120,7 +144,7 @@ class BinanceAPI {
 
             return { data: allCandles, isMock: false };
         } catch (error) {
-            console.warn('API 호출 실패, Mock 데이터를 사용합니다.', error);
+            console.error('API 호출 실패 (브라우저 콘솔 확인 요망), Mock 데이터를 사용합니다.', error);
             return { data: this.generateMockData(), isMock: true };
         }
     }
@@ -364,7 +388,7 @@ class ChartEngine {
 // ==========================================
 
 export default function App() {
-    const [symbol, setSymbol] = useState('BTCUSDT');
+    const [symbol, setSymbol] = useState('BTC-USDT');
     const [interval, setInterval] = useState<CandleInterval>('4h');
     const [rrRatio, setRrRatio] = useState<number>(2.0); 
     
@@ -402,7 +426,7 @@ export default function App() {
         try {
             const startMs = new Date(startDate).getTime();
             const endMs = new Date(endDate).getTime() + 86399999; 
-            const { data, isMock } = await BinanceAPI.fetchKlines(symbol, interval, startMs, endMs, 1000);
+            const { data, isMock } = await BingXAPI.fetchKlines(symbol, interval, startMs, endMs, 1000);
             
             setRawCandles(data);
             setIsMockData(isMock);
@@ -963,7 +987,7 @@ export default function App() {
                                 {isMockData ? (
                                     <span className="bg-orange-500/10 text-orange-400 px-2 py-0.5 rounded text-[10px] font-bold border border-orange-500/30 uppercase tracking-wider">Mock Data</span>
                                 ) : (
-                                    <span className="bg-green-500/10 text-green-400 px-2 py-0.5 rounded text-[10px] font-bold border border-green-500/30 uppercase tracking-wider">Live Binance</span>
+                                    <span className="bg-green-500/10 text-green-400 px-2 py-0.5 rounded text-[10px] font-bold border border-green-500/30 uppercase tracking-wider">Live BingX</span>
                                 )}
                             </h1>
                             <p className="text-sm text-slate-400">Advanced Chronological Backtester</p>
@@ -972,9 +996,9 @@ export default function App() {
 
                     <div className="flex flex-wrap items-center gap-3 w-full xl:w-auto">
                         <select value={symbol} onChange={(e) => setSymbol(e.target.value)} className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
-                            <option value="BTCUSDT">BTC/USDT</option>
-                            <option value="ETHUSDT">ETH/USDT</option>
-                            <option value="SOLUSDT">SOL/USDT</option>
+                            <option value="BTC-USDT">BTC/USDT</option>
+                            <option value="ETH-USDT">ETH/USDT</option>
+                            <option value="SOL-USDT">SOL/USDT</option>
                         </select>
                         <select value={interval} onChange={(e) => setInterval(e.target.value as CandleInterval)} className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
                             <option value="1h">1 Hour</option>

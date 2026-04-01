@@ -20,8 +20,20 @@ export interface Box extends Zone {
     breakoutIndex: number; high: number; low: number; ep: number; sl: number; tp: number; touchedAt?: number; resolvedAt?: number; realizedPnl?: number; realizedPnlPercent?: number; isEntered?: boolean; enteredAt?: number; assetRoiPercent?: number; positionSize?: number; riskAmount?: number; marginUsed?: number; skipReason?: 'max_positions' | 'no_margin' | 'sl_before_ep';
 }
 
-export class BinanceAPI {
-    private static readonly BASE_URL = 'https://api.binance.com/api/v3';
+function parseIntervalToMs(interval: string): number {
+    const unit = interval.slice(-1);
+    const value = parseInt(interval.slice(0, -1));
+    switch (unit) {
+        case 'm': return value * 60 * 1000;
+        case 'h': return value * 60 * 60 * 1000;
+        case 'd': return value * 24 * 60 * 60 * 1000;
+        case 'w': return value * 7 * 24 * 60 * 60 * 1000;
+        default: return 15 * 60 * 1000;
+    }
+}
+
+export class BingXAPI {
+    private static readonly BASE_URL = 'https://open-api.bingx.com';
     static async fetchKlines(symbol: string, interval: CandleInterval, startTime?: number, endTime?: number, limit = 1000): Promise<{data: Candle[], isMock: boolean}> {
         let allCandles: Candle[] = [];
         let currentStartTime = startTime;
@@ -29,16 +41,29 @@ export class BinanceAPI {
         const MAX_FETCHES = 30; 
         try {
             while (fetchCount < MAX_FETCHES) {
-                let url = `${this.BASE_URL}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+                let url = `${this.BASE_URL}/openApi/swap/v3/quote/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
                 if (currentStartTime) url += `&startTime=${currentStartTime}`;
                 if (endTime) url += `&endTime=${endTime}`;
                 const response = await fetch(url);
-                if (!response.ok) throw new Error(`Binance API error: ${response.statusText}`);
-                const rawData: any[][] = await response.json();
+                if (!response.ok) throw new Error(`BingX API error: ${response.statusText}`);
+                const json = await response.json();
+                if (json.code !== 0) throw new Error(`BingX API error code ${json.code}: ${json.msg}`);
+                
+                const rawData: any[] = json.data || [];
                 if (rawData.length === 0) break; 
+                
+                // 오래된 데이터가 먼저 오도록 정렬 보장
+                rawData.sort((a, b) => Number(a.time) - Number(b.time));
+
                 const data = rawData.map(row => {
-                    const open = parseFloat(row[1]); const close = parseFloat(row[4]);
-                    return { openTime: row[0], open, high: parseFloat(row[2]), low: parseFloat(row[3]), close, volume: parseFloat(row[5]), closeTime: row[6], isBullish: close >= open };
+                    const open = parseFloat(row.open);
+                    const close = parseFloat(row.close);
+                    const high = parseFloat(row.high);
+                    const low = parseFloat(row.low);
+                    const volume = parseFloat(row.volume || row.vol || 0);
+                    const openTime = Number(row.time);
+                    const closeTime = openTime + parseIntervalToMs(interval) - 1;
+                    return { openTime, open, high, low, close, volume, closeTime, isBullish: close >= open };
                 });
                 allCandles = allCandles.concat(data);
                 const lastCandle = data[data.length - 1];
