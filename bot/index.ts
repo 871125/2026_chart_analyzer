@@ -1,6 +1,6 @@
 import { botConfig } from './config';
 import { sendTelegramMessage } from './telegram';
-import { placeOrderWithTPSL, getActivePositionsCount } from './bingx';
+import { placeOrderWithTPSL, getActivePositionsCount, setLeverage, fetchAndCacheExchangeInfo, getSymbolInfo } from './binance';
 import { BinanceAPI, ChartEngine, Box } from './engine';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -55,9 +55,23 @@ async function runBot() {
     console.log("🚀 봇 시스템 부팅 완료, 초기화를 시작합니다...");
     await loadState(); // 부팅 시 저장된 상태 복구
 
+    // 봇 부팅 시 거래소 정보 로드 (가장 먼저 실행되어야 함)
+    await fetchAndCacheExchangeInfo();
+
+    // 봇 부팅 시 레버리지 설정
+    try {
+        await setLeverage(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL, botConfig.TRADING_OPTIONS.LEVERAGE);
+    } catch (e) {
+        // setLeverage 내부에서 이미 에러를 처리하고, 심각한 경우에만 던지므로
+        // 여기서 봇을 중지하거나 추가적인 처리를 할 수 있습니다.
+        // 지금은 에러 메시지를 보내고 계속 진행합니다.
+        await sendTelegramMessage(`🚨 [중요] 봇 부팅 중 레버리지 설정에 실패했습니다. 거래를 시작하기 전에 바이낸스 웹사이트에서 직접 설정을 확인해주세요.`);
+    }
+
     let bootMessage = (
         `🚀 퀀트 자동 매매 봇 부팅 완료\n` +
-        `- 거래 페어: ${botConfig.TRADING_OPTIONS.BINGX_SYMBOL}\n` +
+        `- 거래 페어: ${botConfig.TRADING_OPTIONS.BINANCE_SYMBOL}\n` +
+        `- 레버리지: ${botConfig.TRADING_OPTIONS.LEVERAGE}x\n` +
         `- 차트 주기: ${botConfig.TRADING_OPTIONS.INTERVAL}\n` +
         `- Check 간격: ${botConfig.CHECK_INTERVAL_MS / 1000}초\n` +
         `=========================\n` +
@@ -160,17 +174,17 @@ async function checkMarket() {
                                 (box.direction === 'short' && currentCandle.high >= box.ep);
 
             if (shouldEnter) {
-                // BingX API로 현재 거래소에 유지 중인 실제 포지션 개수 조회
+                // Binance API로 현재 거래소에 유지 중인 실제 포지션 개수 조회
                 let currentPositionCount = 0;
                 try {
-                    currentPositionCount = await getActivePositionsCount(botConfig.TRADING_OPTIONS.BINGX_SYMBOL);
+                    currentPositionCount = await getActivePositionsCount(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL);
                 } catch (apiErr: any) {
-                    console.error("[BingX 포지션 개수 조회 실패]:", apiErr.message);
+                    console.error("[Binance 포지션 개수 조회 실패]:", apiErr.message);
                     continue; // API 오류 시 안전을 위해 진입을 스킵하고 다음 주기에 재시도
                 }
 
                 if (currentPositionCount >= botConfig.TRADING_OPTIONS.MAX_POSITIONS) {
-                    sendTelegramMessage(`⚠️ [진입 스킵] BingX 거래소에 유지 중인 포지션이 최대치(${botConfig.TRADING_OPTIONS.MAX_POSITIONS}개)입니다.`);
+                    sendTelegramMessage(`⚠️ [진입 스킵] Binance 거래소에 유지 중인 포지션이 최대치(${botConfig.TRADING_OPTIONS.MAX_POSITIONS}개)입니다.`);
                     activePositions.push(box); // 중복 감지 방지를 위해 이력에 추가
                     if (activePositions.length > 50) activePositions.shift();
                     pendingBoxes.splice(i, 1);
@@ -180,27 +194,42 @@ async function checkMarket() {
 
                 const side = box.direction === 'long' ? 'BUY' : 'SELL';
                 
+                // 심볼 정보(최소 주문금액, 정밀도 등) 가져오기
+                const symbolInfo = getSymbolInfo(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL);
+
                 // 운용 자산 및 설정된 리스크 비율 기반 진입 수량(Quantity) 동적 계산
                 const riskAmount = botConfig.TRADING_OPTIONS.CAPITAL * (botConfig.TRADING_OPTIONS.RISK_PER_TRADE / 100);
                 const slPercent = Math.max(Math.abs(box.ep - box.sl) / box.ep, 0.0001); // 손절폭 비율
                 const idealPosSizeUsd = riskAmount / slPercent; // 총 투입 포지션 규모 (USD)
-                const quantity = Number((idealPosSizeUsd / currentPrice).toFixed(4)); // 실제 코인 수량 (거래소 규격에 맞게 소수점 4자리 절사)
-                
-                try {
-                    // 6. BingX API를 통해 시장가 진입과 동시에 TP/SL 주문 접수
-                    const orderResult = await placeOrderWithTPSL(botConfig.TRADING_OPTIONS.BINGX_SYMBOL, side, quantity, box.tp, box.sl);
 
-                    // BingX API는 잔고 부족/수량 미달 시에도 HTTP 200을 반환하므로 내부 code를 반드시 확인해야 합니다. (보통 0이 성공)
-                    if (orderResult && orderResult.code !== 0) {
-                        throw new Error(`API 응답 에러 (코드: ${orderResult.code}, 메시지: ${orderResult.msg})`);
-                    }
+                // 최소 주문 금액(minNotional) 체크
+                if (idealPosSizeUsd < symbolInfo.minNotional) {
+                    sendTelegramMessage(`ℹ️ [진입 스킵] 계산된 포지션 규모($${idealPosSizeUsd.toFixed(2)})가 바이낸스 최소 주문금액($${symbolInfo.minNotional})보다 작습니다.`);
+                    // 이 타점은 자본금이 늘어나지 않는 이상 계속 실패할 것이므로 폐기 처리
+                    activePositions.push(box); 
+                    if (activePositions.length > 50) activePositions.shift();
+                    pendingBoxes.splice(i, 1);
+                    stateChanged = true;
+                    continue;
+                }
+
+                // API에서 가져온 동적 수량 정밀도 적용
+                const quantity = Number((idealPosSizeUsd / currentPrice).toFixed(symbolInfo.quantityPrecision));
+
+                try {
+                    // 6. Binance API를 통해 시장가 진입과 동시에 TP/SL 주문 접수
+                    const orderResult = await placeOrderWithTPSL(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL, side, quantity, box.tp, box.sl);
+
+                    // Binance API는 잔고 부족/수량 미달 시에도 HTTP 200을 반환하므로 내부 code를 반드시 확인해야 합니다.
+                    // placeOrderWithTPSL 내부에서 에러 처리를 하므로 여기서는 성공 케이스만 다룹니다.
+                    const marketOrder = Array.isArray(orderResult) ? orderResult.find(o => o.type === 'MARKET') : null;
 
                     sendTelegramMessage(
                         `✅ [주문 체결 성공] ${side} 포지션 진입!\n` +
                         `진입가격: ${currentPrice}\n` +
                         `설정된 TP: ${box.tp.toFixed(2)} / SL: ${box.sl.toFixed(2)}\n` +
                         `주문수량: ${quantity}\n` +
-                        `주문번호: ${orderResult?.data?.orderId || '확인불가'}`
+                        `주문번호: ${marketOrder?.orderId || '확인불가'}`
                     );
                     
                     box.isEntered = true;
@@ -209,8 +238,8 @@ async function checkMarket() {
                     pendingBoxes.splice(i, 1);
                     stateChanged = true;
                 } catch (e: any) {
-                    sendTelegramMessage(`❌ [주문 실패] BingX API 오류: ${e.message}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)`);
-                    console.error("[BingX 주문 에러 상세]:", e);
+                    sendTelegramMessage(`❌ [주문 실패] Binance API 오류: ${e.message}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)`);
+                    console.error("[Binance 주문 에러 상세]:", e);
                     activePositions.push(box); // 무한 에러 루프 방지를 위해 이력에 추가
                     if (activePositions.length > 50) activePositions.shift();
                     pendingBoxes.splice(i, 1); // 에러 발생 시 대기열에서 확실히 제거
