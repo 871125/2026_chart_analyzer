@@ -1,12 +1,13 @@
 import { botConfig } from './config';
 import { sendTelegramMessage } from './telegram';
-import { placeOrderWithTPSL, getActivePositionsCount, setLeverage, fetchAndCacheExchangeInfo, getSymbolInfo } from './binance';
+import { placeEntryOrder, placeCloseOrder, getActivePositionsCount, setLeverage, fetchAndCacheExchangeInfo, getSymbolInfo } from './binance';
 import { BinanceAPI, ChartEngine, Box } from './engine';
 import * as fs from 'fs';
 import * as path from 'path';
 
 let pendingBoxes: Box[] = [];
 let activePositions: Box[] = [];
+let openPositions: Box[] = []; // 실제 거래소에 오픈되어 있는 포지션 목록
 let isProcessing: boolean = false; // 동시 실행 방지용 Lock
 let lastCalculatedPeriod: number = 0; // 마지막으로 계산된 주기(Period) 번호
 
@@ -21,8 +22,9 @@ async function loadState() {
             // 기존에 너무 많이 저장된 박스가 있다면 스팸 방지를 위해 최근 5개만 로드
             pendingBoxes = (parsed.pendingBoxes || []).slice(-5);
             activePositions = parsed.activePositions || [];
+            openPositions = parsed.openPositions || [];
             lastCalculatedPeriod = parsed.lastCalculatedPeriod || 0;
-            console.log(`✅ [상태 복구 완료] 대기 타점: ${pendingBoxes.length}개 / 진입 이력(중복방지): ${activePositions.length}개`);
+            console.log(`✅ [상태 복구 완료] 대기 타점: ${pendingBoxes.length}개 / 오픈 포지션: ${openPositions.length}개 / 진입 이력(중복방지): ${activePositions.length}개`);
         }
     } catch (e) {
         console.error("⚠️ 상태 파일 로드 실패. 빈 상태로 시작합니다.", e);
@@ -31,7 +33,7 @@ async function loadState() {
 
 async function saveState() {
     try {
-        const state = { pendingBoxes, activePositions, lastCalculatedPeriod };
+        const state = { pendingBoxes, activePositions, openPositions, lastCalculatedPeriod };
         await fs.promises.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
     } catch (e) {
         console.error("⚠️ 상태 저장 중 오류 발생:", e);
@@ -75,11 +77,17 @@ async function runBot() {
         `- 차트 주기: ${botConfig.TRADING_OPTIONS.INTERVAL}\n` +
         `- Check 간격: ${botConfig.CHECK_INTERVAL_MS / 1000}초\n` +
         `=========================\n` +
-        `📋 *[부팅 시 대기 중인 타점: ${pendingBoxes.length}개]*\n`
+        `📋 *[복구된 상태]*\n` +
+        ` • 오픈 포지션: ${openPositions.length}개\n` +
+        ` • 대기 타점: ${pendingBoxes.length}개\n`
     );
 
     if (pendingBoxes.length > 0) {
-        bootMessage += pendingBoxes.map(b => `• ${b.direction.toUpperCase()} | 패턴: ${b.archetype} | EP: ${b.ep.toFixed(2)}`).join('\n');
+        bootMessage += `\n*[대기 타점 목록]*\n`
+        bootMessage += pendingBoxes.map(b => ` • ${b.direction.toUpperCase()} | EP: ${b.ep.toFixed(2)}`).join('\n');
+    } else if (openPositions.length > 0) {
+        bootMessage += `\n*[오픈 포지션 목록]*\n`
+        bootMessage += openPositions.map(p => ` • ${p.direction.toUpperCase()} | 진입가: ${p.enteredPrice?.toFixed(2)} | 수량: ${p.quantity}`).join('\n');
     } else {
         bootMessage += `• 대기 중인 타점이 없습니다.`;
     }
@@ -103,15 +111,19 @@ async function checkMarket() {
         // 현재 시간을 밀리초 단위 주기로 나누어 현재 주기(Period) 계산 (UTC 기준 정각 동기화)
         const currentPeriod = Math.floor(now / intervalMs);
         
-        // 정해진 INTERVAL 주기(정각)가 변경되었거나 최초 실행인 경우에만 박스(타점) 재계산
+        // 정해진 INTERVAL 주기(정각)가 변경된 경우에만 박스(타점) 재계산
         const shouldCalcBoxes = currentPeriod > lastCalculatedPeriod;
 
-        // 1. Binance로부터 OHLCV 최신 데이터 갱신
-        // 박스 계산 주기에는 1000개를 로드하고, 평상시 진입/청산 확인용으로는 부하를 줄이기 위해 최근 2개 캔들만 로드합니다.
+        // 봇 최초 실행 시(lastCalculatedPeriod=0)에만 SCAN_START_DATE부터 전체 데이터를 가져오고,
+        // 그 이후 주기적인 박스 재계산 시에는 최신 1000개 캔들만 사용합니다.
+        const startTimeForFetch = (shouldCalcBoxes && lastCalculatedPeriod === 0 && botConfig.TRADING_OPTIONS.SCAN_START_DATE)
+            ? new Date(botConfig.TRADING_OPTIONS.SCAN_START_DATE).getTime()
+            : undefined;
+
         const { data, isMock } = await BinanceAPI.fetchKlines(
             botConfig.TRADING_OPTIONS.BINANCE_SYMBOL, 
             botConfig.TRADING_OPTIONS.INTERVAL, 
-            undefined, // START_DATE부터 가져오는 페이징 부하 제거 
+            startTimeForFetch,
             undefined, 
             shouldCalcBoxes ? 1000 : 2
         );
@@ -131,7 +143,18 @@ async function checkMarket() {
             const newPendingBoxes = detectedBoxes.filter(box => {
                 const isPending = pendingBoxes.find(b => b.id === box.id);
                 const isActive = activePositions.find(b => b.id === box.id);
-                return !isPending && !isActive && box.status === 'active';
+                if (isPending || isActive || box.status !== 'active') return false;
+
+                // 주기적인 재계산 시, 1000개 캔들 내의 과거 타점이 이력(50개 제한)에서 밀려나
+                // 다시 신규로 감지되는 현상("전체 시간 계산")을 완벽히 방지합니다.
+                // 이전 계산 주기 시점 이후에 확정된 진짜 신규 타점만 통과시킵니다.
+                if (lastCalculatedPeriod > 0) {
+                    const lastCalcTime = lastCalculatedPeriod * intervalMs;
+                    if (box.createdAt < lastCalcTime) {
+                        return false;
+                    }
+                }
+                return true;
             }).slice(-5); // 혹시 모를 대량 알람 방지를 위해 최대 5개까지만 허용
 
             // 주기 마감 시 신규 타점이 없더라도 분석 완료 알림 전송 (생존 신고)
@@ -177,7 +200,7 @@ async function checkMarket() {
                 // Binance API로 현재 거래소에 유지 중인 실제 포지션 개수 조회
                 let currentPositionCount = 0;
                 try {
-                    currentPositionCount = await getActivePositionsCount(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL);
+                    currentPositionCount = await getActivePositionsCount();
                 } catch (apiErr: any) {
                     console.error("[Binance 포지션 개수 조회 실패]:", apiErr.message);
                     continue; // API 오류 시 안전을 위해 진입을 스킵하고 다음 주기에 재시도
@@ -218,21 +241,21 @@ async function checkMarket() {
 
                 try {
                     // 6. Binance API를 통해 시장가 진입과 동시에 TP/SL 주문 접수
-                    const orderResult = await placeOrderWithTPSL(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL, side, quantity, box.tp, box.sl);
-
-                    // Binance API는 잔고 부족/수량 미달 시에도 HTTP 200을 반환하므로 내부 code를 반드시 확인해야 합니다.
-                    // placeOrderWithTPSL 내부에서 에러 처리를 하므로 여기서는 성공 케이스만 다룹니다.
-                    const marketOrder = Array.isArray(orderResult) ? orderResult.find(o => o.type === 'MARKET') : null;
+                    const orderResult = await placeEntryOrder(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL, side, quantity);
 
                     sendTelegramMessage(
                         `✅ [주문 체결 성공] ${side} 포지션 진입!\n` +
                         `진입가격: ${currentPrice}\n` +
                         `설정된 TP: ${box.tp.toFixed(2)} / SL: ${box.sl.toFixed(2)}\n` +
                         `주문수량: ${quantity}\n` +
-                        `주문번호: ${marketOrder?.orderId || '확인불가'}`
+                        `주문번호: ${orderResult?.orderId || '확인불가'}`
                     );
                     
                     box.isEntered = true;
+                    box.enteredPrice = currentPrice; // 실제 진입 가격 저장
+                    box.quantity = quantity; // 실제 주문 수량 저장
+
+                    openPositions.push(box); // 활성 포지션 목록에 추가
                     activePositions.push(box);
                     if (activePositions.length > 50) activePositions.shift(); // 재진입 방지용 이력 유지 (최대 50개)
                     pendingBoxes.splice(i, 1);
@@ -248,6 +271,46 @@ async function checkMarket() {
             }
         }
         
+        // 5. 현재 오픈된 포지션들의 SL/TP 도달 여부 체크
+        for (let i = openPositions.length - 1; i >= 0; i--) {
+            const pos = openPositions[i];
+            let isResolved = false;
+            let resolutionType: 'TP' | 'SL' | null = null;
+
+            // 롱 포지션: 현재가가 SL보다 낮거나, TP보다 높으면 청산
+            if (pos.direction === 'long') {
+                if (currentPrice <= pos.sl) { isResolved = true; resolutionType = 'SL'; }
+                else if (currentPrice >= pos.tp) { isResolved = true; resolutionType = 'TP'; }
+            } 
+            // 숏 포지션: 현재가가 SL보다 높거나, TP보다 낮으면 청산
+            else {
+                if (currentPrice >= pos.sl) { isResolved = true; resolutionType = 'SL'; }
+                else if (currentPrice <= pos.tp) { isResolved = true; resolutionType = 'TP'; }
+            }
+
+            if (isResolved && pos.quantity) {
+                try {
+                    const positionSide = pos.direction === 'long' ? 'LONG' : 'SHORT';
+                    await placeCloseOrder(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL, positionSide, pos.quantity);
+
+                    sendTelegramMessage(
+                        `✅ *[${resolutionType} 청산]* ${pos.direction.toUpperCase()} 포지션 종료\n` +
+                        `진입가: ${pos.enteredPrice?.toFixed(2)}\n` +
+                        `청산가: ${currentPrice.toFixed(2)}\n` +
+                        `수량: ${pos.quantity}`
+                    );
+
+                    openPositions.splice(i, 1); // 오픈 포지션 목록에서 제거
+                    stateChanged = true;
+
+                } catch (e: any) {
+                    sendTelegramMessage(`🚨 *[청산 주문 실패]* ${pos.direction.toUpperCase()} 포지션 청산 중 오류 발생. 수동 확인이 필요합니다!\n오류: ${e.message}`);
+                    console.error("[청산 주문 에러 상세]:", e);
+                    // 청산에 실패했으므로, 다음 주기에서 재시도하기 위해 목록에서 제거하지 않음
+                }
+            }
+        }
+
         // 상태 변경점이 하나라도 있다면 JSON 파일에 덮어쓰기
         if (stateChanged) {
             await saveState();

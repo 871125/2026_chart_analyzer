@@ -103,69 +103,51 @@ export async function setLeverage(symbol: string, leverage: number) {
 }
 
 /**
- * Binance Futures API에 진입 주문(Market)과 동시에 TP(Take Profit), SL(Stop Loss)을 함께 전송합니다.
- * (batchOrders 엔드포인트를 사용)
+ * Binance Futures API에 시장가 진입 주문을 전송합니다. (헷지 모드 지원)
  */
-export async function placeOrderWithTPSL(
+export async function placeEntryOrder(
     symbol: string, 
     side: 'BUY' | 'SELL', 
-    quantity: number, 
-    takeProfit: number, 
-    stopLoss: number
+    quantity: number
 ) {
-    const oppositeSide = side === 'BUY' ? 'SELL' : 'BUY';
+    const positionSide = side === 'BUY' ? 'LONG' : 'SHORT';
 
     // 동적으로 심볼 정보 가져오기
-    const { pricePrecision, quantityPrecision } = getSymbolInfo(symbol);
-    const orders = [
-        // 1. Market Order for entry
-        {
-            symbol,
-            side,
-            type: 'MARKET',
-            quantity: quantity.toFixed(quantityPrecision),
-        },
-        // 2. Stop Market for Stop Loss
-        {
-            symbol,
-            side: oppositeSide,
-            type: 'STOP_MARKET',
-            stopPrice: stopLoss.toFixed(pricePrecision),
-            closePosition: 'true',
-        },
-        // 3. Take Profit Market for Take Profit
-        {
-            symbol,
-            side: oppositeSide,
-            type: 'TAKE_PROFIT_MARKET',
-            stopPrice: takeProfit.toFixed(pricePrecision),
-            closePosition: 'true',
-        }
-    ];
+    const { quantityPrecision } = getSymbolInfo(symbol);
+    const qtyString = quantity.toFixed(quantityPrecision);
 
-    const params = {
-        batchOrders: JSON.stringify(orders)
-    };
-
-    const result = await signedRequest('POST', '/fapi/v1/batchOrders', params);
-
-    // batchOrders는 성공 시 각 주문 결과를 배열로 반환합니다.
-    // 하나라도 실패하면 에러를 던집니다.
-    if (Array.isArray(result)) {
-        const failedOrder = result.find(o => o.code && o.code !== 0);
-        if (failedOrder) {
-            throw new Error(`개별 주문 실패 (코드: ${failedOrder.code}, 메시지: ${failedOrder.msg})`);
-        }
-    }
-    
-    return result;
+    // 1. 진입(Market) 주문 전송 (일반 주문 API 사용)
+    const entryResult = await signedRequest('POST', '/fapi/v1/order', {
+        symbol,
+        side,
+        positionSide,
+        type: 'MARKET',
+        quantity: qtyString,
+    });
+    return entryResult;
 }
 
 /**
- * Binance API를 호출하여 현재 유지 중인 활성 포지션 개수를 반환합니다.
+ * Binance Futures API에 시장가 청산 주문을 전송합니다. (헷지 모드 지원)
  */
-export async function getActivePositionsCount(symbol: string): Promise<number> {
-    const positions = await signedRequest('GET', '/fapi/v2/positionRisk', { symbol });
+export async function placeCloseOrder(symbol: string, positionSide: 'LONG' | 'SHORT', quantity: number) {
+    const side = positionSide === 'LONG' ? 'SELL' : 'BUY';
+    const { quantityPrecision } = getSymbolInfo(symbol);
+
+    return await signedRequest('POST', '/fapi/v1/order', {
+        symbol,
+        side,
+        positionSide,
+        type: 'MARKET',
+        quantity: quantity.toFixed(quantityPrecision)
+    });
+}
+
+/**
+ * Binance API를 호출하여 현재 유지 중인 모든 활성 포지션 개수를 반환합니다.
+ */
+export async function getActivePositionsCount(): Promise<number> {
+    const positions = await signedRequest('GET', '/fapi/v2/positionRisk');
     
     if (!Array.isArray(positions)) {
         console.warn("Binance 포지션 정보가 배열이 아닙니다:", positions);

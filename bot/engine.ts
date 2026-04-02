@@ -18,6 +18,9 @@ export interface Zone {
 export interface Box extends Zone {
     type: 'sideways_box'; archetype: 'continuation_box' | 'breakout_prep_box' | 'turning_point_base' | 'unknown';
     breakoutIndex: number; high: number; low: number; ep: number; sl: number; tp: number; touchedAt?: number; resolvedAt?: number; realizedPnl?: number; realizedPnlPercent?: number; isEntered?: boolean; enteredAt?: number; assetRoiPercent?: number; positionSize?: number; riskAmount?: number; marginUsed?: number; skipReason?: 'max_positions' | 'no_margin' | 'sl_before_ep';
+    // 자동 매매 봇에서 사용하는 추가 필드
+    quantity?: number; // 실제 주문 수량
+    enteredPrice?: number; // 실제 진입 가격
 }
 
 export class BinanceAPI {
