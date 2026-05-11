@@ -158,3 +158,19 @@ export async function getActivePositionsCount(): Promise<number> {
     const activePositions = positions.filter((pos: any) => Math.abs(Number(pos.positionAmt || 0)) > 0);
     return activePositions.length;
 }
+
+/**
+ * Binance Futures API에서 현재 계좌의 자산 잔고(Balance)를 조회합니다.
+ */
+export async function getAccountBalance(asset: string = 'USDT'): Promise<number> {
+    try {
+        const balances = await signedRequest('GET', '/fapi/v2/balance');
+        if (!Array.isArray(balances)) {
+            throw new Error("잔고 정보가 올바른 배열 형태가 아닙니다.");
+        }
+        const targetAsset = balances.find((b: any) => b.asset === asset);
+        return targetAsset ? parseFloat(targetAsset.balance) : 0;
+    } catch (error: any) {
+        throw new Error(`계좌 잔고 조회 실패: ${error.message}`);
+    }
+}

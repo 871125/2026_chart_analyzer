@@ -1,6 +1,6 @@
 import { botConfig } from './config';
 import { sendTelegramMessage } from './telegram';
-import { placeEntryOrder, placeCloseOrder, getActivePositionsCount, setLeverage, fetchAndCacheExchangeInfo, getSymbolInfo } from './binance';
+import { placeEntryOrder, placeCloseOrder, getActivePositionsCount, setLeverage, fetchAndCacheExchangeInfo, getSymbolInfo, getAccountBalance } from './binance';
 import { BinanceAPI, ChartEngine, Box } from './engine';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -220,8 +220,16 @@ async function checkMarket() {
                 // 심볼 정보(최소 주문금액, 정밀도 등) 가져오기
                 const symbolInfo = getSymbolInfo(botConfig.TRADING_OPTIONS.BINANCE_SYMBOL);
 
-                // 운용 자산 및 설정된 리스크 비율 기반 진입 수량(Quantity) 동적 계산
-                const riskAmount = botConfig.TRADING_OPTIONS.CAPITAL * (botConfig.TRADING_OPTIONS.RISK_PER_TRADE / 100);
+                // 실제 계좌 잔고를 조회하여 복리(Compounding)가 적용된 자본금으로 사용
+                let currentCapital = botConfig.TRADING_OPTIONS.CAPITAL;
+                try {
+                    currentCapital = await getAccountBalance('USDT'); // USDT 잔고 기준
+                } catch (balanceErr: any) {
+                    console.warn(`[잔고 조회 실패] 설정된 기본 CAPITAL($${currentCapital})을 사용합니다:`, balanceErr.message);
+                }
+
+                // 실제 자산(또는 설정된 자산) 및 리스크 비율 기반 진입 수량(Quantity) 동적 계산
+                const riskAmount = currentCapital * (botConfig.TRADING_OPTIONS.RISK_PER_TRADE / 100);
                 const slPercent = Math.max(Math.abs(box.ep - box.sl) / box.ep, 0.0001); // 손절폭 비율
                 const idealPosSizeUsd = riskAmount / slPercent; // 총 투입 포지션 규모 (USD)
 
