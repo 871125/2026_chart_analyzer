@@ -1,4 +1,11 @@
-"""자동 매매 봇 메인 루프 (bot/index.ts 이식).
+"""자동 매매 봇 메인 루프 (bot/index.ts 이식, 멀티 심볼 공유 자본/증거금 풀 지원).
+
+여러 심볼을 config.TRADING_OPTIONS.binance_symbols에 넣으면 하나의 공유
+자본/증거금 풀 아래에서 함께 운용된다 (bot_py/backtest.py의
+run_multi_symbol_backtest와 동일한 진입 규칙): 포지션이 없을 때는 먼저
+신호(EP 터치)가 뜬 심볼이 우선 진입하고, 이미 포지션이 있는 상태에서 다른
+심볼 신호가 뜨면 그 시점의 남은 가용 증거금으로 진입한다. max_positions도
+심볼 구분 없이 전체 기준으로 공유된다.
 
 실행: 저장소 루트에서 `python -m bot_py.main`
 """
@@ -13,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import binance_client, config
-from .engine import BinanceAPI, Box, ChartEngine, ScoreBreakdown
+from .engine import BinanceAPI, Box, Candle, ChartEngine, ScoreBreakdown
 from .telegram_notifier import send_telegram_message
 
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
@@ -80,16 +87,19 @@ def run_bot() -> None:
 
     binance_client.fetch_and_cache_exchange_info()
 
-    try:
-        binance_client.set_leverage(config.TRADING_OPTIONS.binance_symbol, config.TRADING_OPTIONS.leverage)
-    except Exception:
-        send_telegram_message(
-            "[중요] 봇 부팅 중 레버리지 설정에 실패했습니다. 거래를 시작하기 전에 바이낸스 웹사이트에서 직접 설정을 확인해주세요."
-        )
+    for symbol in config.TRADING_OPTIONS.binance_symbols:
+        try:
+            binance_client.set_leverage(symbol, config.TRADING_OPTIONS.leverage)
+        except Exception:
+            send_telegram_message(
+                f"[중요] 봇 부팅 중 {symbol} 레버리지 설정에 실패했습니다. "
+                "거래를 시작하기 전에 바이낸스 웹사이트에서 직접 설정을 확인해주세요."
+            )
 
+    symbols_label = ", ".join(config.TRADING_OPTIONS.binance_symbols)
     boot_message = (
         "퀀트 자동 매매 봇 부팅 완료\n"
-        f"- 거래 페어: {config.TRADING_OPTIONS.binance_symbol}\n"
+        f"- 거래 페어(공유 풀): {symbols_label}\n"
         f"- 레버리지: {config.TRADING_OPTIONS.leverage}x\n"
         f"- 차트 주기: {config.TRADING_OPTIONS.interval}\n"
         f"- Check 간격: {config.CHECK_INTERVAL_SEC}초\n"
@@ -101,11 +111,13 @@ def run_bot() -> None:
 
     if pending_boxes:
         boot_message += "\n[대기 타점 목록]\n"
-        boot_message += "\n".join(f" - {b.direction.upper()} | EP: {b.ep:.2f}" for b in pending_boxes)
+        boot_message += "\n".join(
+            f" - [{b.symbol}] {b.direction.upper()} | EP: {b.ep:.2f}" for b in pending_boxes
+        )
     elif open_positions:
         boot_message += "\n[오픈 포지션 목록]\n"
         boot_message += "\n".join(
-            f" - {p.direction.upper()} | 진입가: {(p.entered_price or 0):.2f} | 수량: {p.quantity}"
+            f" - [{p.symbol}] {p.direction.upper()} | 진입가: {(p.entered_price or 0):.2f} | 수량: {p.quantity}"
             for p in open_positions
         )
     else:
@@ -134,39 +146,51 @@ def check_market() -> None:
             scan_start = datetime.strptime(config.TRADING_OPTIONS.scan_start_date, "%Y-%m-%d")
             start_time_for_fetch = int(scan_start.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
-        candles, is_mock = BinanceAPI.fetch_klines(
-            config.TRADING_OPTIONS.binance_symbol,
-            config.TRADING_OPTIONS.interval,
-            start_time_for_fetch,
-            None,
-            1000 if should_calc_boxes else 2,
-        )
+        latest_candles: dict[str, Candle] = {}
+        latest_prices: dict[str, float] = {}
+        new_pending_boxes: list[Box] = []
 
-        if not candles or is_mock:
+        for symbol in config.TRADING_OPTIONS.binance_symbols:
+            candles, is_mock = BinanceAPI.fetch_klines(
+                symbol,
+                config.TRADING_OPTIONS.interval,
+                start_time_for_fetch,
+                None,
+                1000 if should_calc_boxes else 2,
+            )
+            if not candles or is_mock:
+                print(f"[{symbol}] 캔들 로드 실패, 이번 주기에는 건너뜁니다.")
+                continue
+
+            latest_candles[symbol] = candles[-1]
+            latest_prices[symbol] = candles[-1].close
+
+            if should_calc_boxes:
+                engine = ChartEngine()
+                detected_boxes = engine.process(
+                    candles, config.TRADING_OPTIONS.interval, config.TRADING_OPTIONS.rr_ratio
+                )
+                for box in detected_boxes:
+                    box.symbol = symbol
+                    box.id = f"{symbol}:{box.id}"
+
+                def _is_new(box: Box) -> bool:
+                    is_pending = any(b.id == box.id for b in pending_boxes)
+                    is_active = any(b.id == box.id for b in active_positions)
+                    if is_pending or is_active or box.status != "active":
+                        return False
+                    if last_calculated_period > 0:
+                        last_calc_time = last_calculated_period * interval_ms
+                        if box.created_at < last_calc_time:
+                            return False
+                    return True
+
+                new_pending_boxes.extend([b for b in detected_boxes if _is_new(b)][-5:])
+
+        if not latest_candles:
             return
 
-        current_candle = candles[-1]
-        current_price = candles[-1].close
-
         if should_calc_boxes:
-            engine = ChartEngine()
-            detected_boxes = engine.process(
-                candles, config.TRADING_OPTIONS.interval, config.TRADING_OPTIONS.rr_ratio
-            )
-
-            def _is_new(box: Box) -> bool:
-                is_pending = any(b.id == box.id for b in pending_boxes)
-                is_active = any(b.id == box.id for b in active_positions)
-                if is_pending or is_active or box.status != "active":
-                    return False
-                if last_calculated_period > 0:
-                    last_calc_time = last_calculated_period * interval_ms
-                    if box.created_at < last_calc_time:
-                        return False
-                return True
-
-            new_pending_boxes = [b for b in detected_boxes if _is_new(b)][-5:]
-
             alert_msg = "[주기 마감: 차트 분석 완료]\n"
             if new_pending_boxes:
                 alert_msg += f"새로운 대기 타점(Pending) {len(new_pending_boxes)}개 감지\n=========================\n"
@@ -174,6 +198,7 @@ def check_market() -> None:
                     pending_boxes.append(box)
                     alert_msg += (
                         "[신규 타점 대기 중]\n"
+                        f"- 심볼: {box.symbol}\n"
                         f"- 패턴: {box.archetype}\n"
                         f"- 방향: {box.direction.upper()}\n"
                         f"- 진입가(EP): {box.ep:.2f}\n"
@@ -191,8 +216,8 @@ def check_market() -> None:
             last_calculated_period = current_period
             state_changed = True
 
-        state_changed = _process_pending_boxes(current_candle, current_price) or state_changed
-        state_changed = _process_open_positions(current_price) or state_changed
+        state_changed = _process_pending_boxes(latest_candles, latest_prices) or state_changed
+        state_changed = _process_open_positions(latest_prices) or state_changed
 
         if state_changed:
             save_state()
@@ -200,18 +225,22 @@ def check_market() -> None:
         print(f"[에러] Market check error: {error}")
 
 
-def _process_pending_boxes(current_candle, current_price: float) -> bool:
+def _process_pending_boxes(latest_candles: dict[str, Candle], latest_prices: dict[str, float]) -> bool:
     global pending_boxes, active_positions, open_positions
     state_changed = False
 
     for i in range(len(pending_boxes) - 1, -1, -1):
         box = pending_boxes[i]
+        current_candle = latest_candles.get(box.symbol)
+        current_price = latest_prices.get(box.symbol)
+        if current_candle is None or current_price is None:
+            continue  # 이번 주기엔 해당 심볼 캔들을 못 받아옴 -> 다음 주기에 재시도
 
         hit_sl_before_entry = (box.direction == "long" and current_candle.low <= box.sl) or (
             box.direction == "short" and current_candle.high >= box.sl
         )
         if hit_sl_before_entry:
-            send_telegram_message(f"[타점 취소] EP 도달 전 SL 먼저 터치됨. 대상 타점: {box.ep:.2f}")
+            send_telegram_message(f"[타점 취소] [{box.symbol}] EP 도달 전 SL 먼저 터치됨. 대상 타점: {box.ep:.2f}")
             active_positions.append(box)
             if len(active_positions) > 50:
                 active_positions.pop(0)
@@ -233,7 +262,7 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
 
         if current_position_count >= config.TRADING_OPTIONS.max_positions:
             send_telegram_message(
-                f"[진입 스킵] Binance 거래소에 유지 중인 포지션이 최대치"
+                f"[진입 스킵] [{box.symbol}] Binance 거래소에 유지 중인 포지션이 최대치"
                 f"({config.TRADING_OPTIONS.max_positions}개)입니다."
             )
             active_positions.append(box)
@@ -244,7 +273,7 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
             continue
 
         side = "BUY" if box.direction == "long" else "SELL"
-        symbol_info = binance_client.get_symbol_info(config.TRADING_OPTIONS.binance_symbol)
+        symbol_info = binance_client.get_symbol_info(box.symbol)
         leverage = config.TRADING_OPTIONS.leverage
 
         current_capital = config.TRADING_OPTIONS.capital
@@ -264,12 +293,13 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
         ideal_pos_size_usd = risk_amount / sl_percent
         ideal_margin = ideal_pos_size_usd / leverage
 
-        # 다른 오픈 포지션이 이미 증거금을 쓰고 있으면, 남은 가용 증거금 한도 내로 포지션을 축소한다
-        # (backtest.py의 시뮬레이션과 동일한 규칙: 최소 증거금 $10 미만이면 진입 스킵).
+        # 다른 심볼의 오픈 포지션이 이미 증거금을 쓰고 있으면, 남은 가용 증거금 한도 내로
+        # 포지션을 축소한다 (backtest.py의 run_multi_symbol_backtest와 동일한 규칙:
+        # 최소 증거금 $10 미만이면 진입 스킵).
         actual_margin = min(ideal_margin, available_margin)
         if actual_margin < 10:
             send_telegram_message(
-                f"[진입 스킵] 가용 증거금(${available_margin:.2f})이 부족합니다. "
+                f"[진입 스킵] [{box.symbol}] 가용 증거금(${available_margin:.2f})이 부족합니다. "
                 f"필요 증거금: ${ideal_margin:.2f}"
             )
             active_positions.append(box)
@@ -283,7 +313,7 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
 
         if actual_pos_size_usd < symbol_info["min_notional"]:
             send_telegram_message(
-                f"[진입 스킵] 계산된 포지션 규모(${actual_pos_size_usd:.2f})가 "
+                f"[진입 스킵] [{box.symbol}] 계산된 포지션 규모(${actual_pos_size_usd:.2f})가 "
                 f"바이낸스 최소 주문금액(${symbol_info['min_notional']})보다 작습니다."
             )
             active_positions.append(box)
@@ -299,11 +329,9 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
         box.risk_amount = actual_pos_size_usd * sl_percent
 
         try:
-            order_result = binance_client.place_entry_order(
-                config.TRADING_OPTIONS.binance_symbol, side, quantity
-            )
+            order_result = binance_client.place_entry_order(box.symbol, side, quantity)
             send_telegram_message(
-                f"[주문 체결 성공] {side} 포지션 진입!\n"
+                f"[주문 체결 성공] [{box.symbol}] {side} 포지션 진입!\n"
                 f"진입가격: {current_price}\n"
                 f"설정된 TP: {box.tp:.2f} / SL: {box.sl:.2f}\n"
                 f"주문수량: {quantity}\n"
@@ -321,7 +349,7 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
             state_changed = True
         except Exception as e:
             send_telegram_message(
-                f"[주문 실패] Binance API 오류: {e}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)"
+                f"[주문 실패] [{box.symbol}] Binance API 오류: {e}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)"
             )
             print(f"[Binance 주문 에러 상세]: {e}")
             active_positions.append(box)
@@ -333,12 +361,16 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
     return state_changed
 
 
-def _process_open_positions(current_price: float) -> bool:
+def _process_open_positions(latest_prices: dict[str, float]) -> bool:
     global open_positions
     state_changed = False
 
     for i in range(len(open_positions) - 1, -1, -1):
         pos = open_positions[i]
+        current_price = latest_prices.get(pos.symbol)
+        if current_price is None:
+            continue  # 이번 주기엔 해당 심볼 캔들을 못 받아옴 -> 다음 주기에 재시도
+
         is_resolved = False
         resolution_type: Optional[str] = None
 
@@ -356,11 +388,9 @@ def _process_open_positions(current_price: float) -> bool:
         if is_resolved and pos.quantity:
             try:
                 position_side = "LONG" if pos.direction == "long" else "SHORT"
-                binance_client.place_close_order(
-                    config.TRADING_OPTIONS.binance_symbol, position_side, pos.quantity
-                )
+                binance_client.place_close_order(pos.symbol, position_side, pos.quantity)
                 send_telegram_message(
-                    f"[{resolution_type} 청산] {pos.direction.upper()} 포지션 종료\n"
+                    f"[{resolution_type} 청산] [{pos.symbol}] {pos.direction.upper()} 포지션 종료\n"
                     f"진입가: {(pos.entered_price or 0):.2f}\n"
                     f"청산가: {current_price:.2f}\n"
                     f"수량: {pos.quantity}"
@@ -369,7 +399,7 @@ def _process_open_positions(current_price: float) -> bool:
                 state_changed = True
             except Exception as e:
                 send_telegram_message(
-                    f"[청산 주문 실패] {pos.direction.upper()} 포지션 청산 중 오류 발생. "
+                    f"[청산 주문 실패] [{pos.symbol}] {pos.direction.upper()} 포지션 청산 중 오류 발생. "
                     f"수동 확인이 필요합니다!\n오류: {e}"
                 )
                 print(f"[청산 주문 에러 상세]: {e}")

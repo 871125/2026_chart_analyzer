@@ -253,6 +253,7 @@ def run_multi_symbol_backtest(
         detected = engine.process(candles, interval, rr_ratio)
         for box in detected:
             box.symbol = symbol
+            box.id = f"{symbol}:{box.id}"  # 심볼 간 id 충돌(같은 open_time) 방지
         pending_boxes.extend(detected)
 
     all_times = sorted(set().union(*(ct.keys() for ct in candles_by_time.values())))
@@ -424,7 +425,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="과거 데이터 기반 백테스트 실행")
     parser.add_argument(
         "--symbol",
-        default=config.TRADING_OPTIONS.binance_symbol,
+        default=",".join(config.TRADING_OPTIONS.binance_symbols),
         help="쉼표로 구분해 여러 심볼 지정 시 공유 자본/증거금 풀로 통합 백테스트 (예: BTCUSDT,SOLUSDT)",
     )
     parser.add_argument("--interval", default=config.TRADING_OPTIONS.interval)

@@ -27,7 +27,7 @@ This repo has two parts: a React dashboard (`chart-analyzer`) and a standalone t
 - Run backtest (from repo root): `python -m bot_py.backtest --start YYYY-MM-DD [--end YYYY-MM-DD --symbol ... --interval ... --capital ... --risk ... --leverage ... --max-positions ... --rr ...]`
 - Deps: `pip install -r bot_py/requirements.txt`
 - Config: `bot_py/config.py` (mirrors `bot/config.ts`; gitignored, never commit real keys).
-- Rules: Keep this in sync with `./bot` when trading logic changes — the two implementations are meant to behave identically. `bot_py/backtest.py` ports the chronological simulator from `chart-analyzer/src/App.tsx` (margin/leverage tracking, multi-position handling, win-rate/MDD); keep it in sync with that too. State is persisted to `bot_py/state.json` (gitignored).
+- Rules: `bot_py` has diverged from `./bot` on purpose — it now trades multiple symbols (`config.TRADING_OPTIONS.binance_symbols`) against one shared capital/margin pool instead of a single symbol (`./bot` still trades one symbol only). Don't assume the two stay in sync; `./bot` is legacy/reference only per user instruction. `bot_py/backtest.py` has both `run_backtest()` (single symbol) and `run_multi_symbol_backtest()` (shared pool, used when `--symbol` gets a comma-separated list). State is persisted to `bot_py/state.json` (gitignored).
 
 ## 3. CI/CD Automation Mode
 - If `CI=true`, do not generate interactive questions. Execute the prompt and terminate.
