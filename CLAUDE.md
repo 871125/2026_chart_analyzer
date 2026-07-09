@@ -15,11 +15,18 @@ This repo has two parts: a React dashboard (`chart-analyzer`) and a standalone t
 - Lint: `npm run lint`
 - Rules: Maintain component separation, optimize state hooks, strict TypeScript typing. No test runner is configured yet.
 
-### Trading Bot (Node.js + TypeScript)
+### Trading Bot (Node.js + TypeScript) — original
 - Path: `./bot`
 - Run (from repo root): `tsx bot/index.ts`
 - Config: `bot/config.ts` (API keys, leverage, risk sizing, Telegram alert settings) — never commit real keys.
 - Rules: No package.json/lint/test setup exists for this directory yet; keep changes consistent with existing file style. State is persisted to `bot/state.json` (gitignored).
+
+### Trading Bot (Python) — port of `./bot`
+- Path: `./bot_py`
+- Run (from repo root): `python -m bot_py.main`
+- Deps: `pip install -r bot_py/requirements.txt`
+- Config: `bot_py/config.py` (mirrors `bot/config.ts`; gitignored, never commit real keys).
+- Rules: Keep this in sync with `./bot` when trading logic changes — the two implementations are meant to behave identically. State is persisted to `bot_py/state.json` (gitignored).
 
 ## 3. CI/CD Automation Mode
 - If `CI=true`, do not generate interactive questions. Execute the prompt and terminate.

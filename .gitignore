@@ -1,5 +1,10 @@
 bot/config.ts
 bot/state.json
 
+bot_py/config.py
+bot_py/state.json
+bot_py/__pycache__/
+__pycache__/
+
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
