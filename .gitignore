@@ -1,2 +1,5 @@
 bot/config.ts
 bot/state.json
+
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
