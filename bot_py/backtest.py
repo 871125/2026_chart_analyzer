@@ -228,6 +228,190 @@ def run_backtest(
     )
 
 
+def run_multi_symbol_backtest(
+    symbol_candles: dict[str, list[Candle]],
+    interval: str,
+    rr_ratio: float,
+    initial_capital: float,
+    risk_per_trade: float,
+    leverage: float,
+    max_positions: int,
+) -> BacktestResult:
+    """여러 심볼이 하나의 공유 자본/증거금 풀을 놓고 경쟁하는 백테스트.
+
+    포지션이 하나도 없을 때는 먼저 신호(EP 터치)가 발생한 심볼이 우선 진입하고,
+    이미 포지션이 있는 상태에서 다른 심볼의 신호가 뜨면 그 시점의 남은 가용
+    증거금 한도 내에서 진입한다. max_positions도 심볼 구분 없이 전체 기준으로
+    공유된다.
+    """
+    candles_by_time: dict[str, dict[int, Candle]] = {}
+    pending_boxes: list[Box] = []
+
+    for symbol, candles in symbol_candles.items():
+        candles_by_time[symbol] = {c.open_time: c for c in candles}
+        engine = ChartEngine()
+        detected = engine.process(candles, interval, rr_ratio)
+        for box in detected:
+            box.symbol = symbol
+        pending_boxes.extend(detected)
+
+    all_times = sorted(set().union(*(ct.keys() for ct in candles_by_time.values())))
+
+    current_equity = initial_capital
+    available_margin = initial_capital
+    total_r = 0.0
+    peak_equity = initial_capital
+    max_drawdown = 0.0
+
+    open_positions: list[Box] = []
+    final_boxes: list[Box] = []
+    curve: list[EquityPoint] = []
+
+    for t in all_times:
+        for i in range(len(open_positions) - 1, -1, -1):
+            pos = open_positions[i]
+            c = candles_by_time[pos.symbol].get(t)
+            if c is None:
+                continue
+            is_resolved = False
+            is_win = False
+            if pos.direction == "long":
+                if c.low <= pos.sl:
+                    is_resolved, is_win = True, False
+                elif c.high >= pos.tp:
+                    is_resolved, is_win = True, True
+            else:
+                if c.high >= pos.sl:
+                    is_resolved, is_win = True, False
+                elif c.low <= pos.tp:
+                    is_resolved, is_win = True, True
+
+            if is_resolved:
+                pnl = _resolve_pnl_and_roi(pos, is_win, rr_ratio)
+                current_equity += pnl
+                available_margin += pos.margin_used + pnl
+                total_r += rr_ratio if is_win else -1
+                pos.status = "reacted" if is_win else "invalidated"
+                pos.resolved_at = c.open_time
+                pos.realized_pnl = pnl
+                pos.realized_pnl_percent = (pnl / (current_equity - pnl)) * 100
+                final_boxes.append(pos)
+                open_positions.pop(i)
+
+        for i in range(len(pending_boxes) - 1, -1, -1):
+            box = pending_boxes[i]
+            c = candles_by_time[box.symbol].get(t)
+            if c is None or t < box.created_at:
+                continue
+            hit_sl_before_entry = (box.direction == "long" and c.low <= box.sl) or (
+                box.direction == "short" and c.high >= box.sl
+            )
+            if hit_sl_before_entry:
+                box.status = "canceled"
+                box.skip_reason = "sl_before_ep"
+                box.resolved_at = c.open_time
+                final_boxes.append(box)
+                pending_boxes.pop(i)
+
+        for i in range(len(pending_boxes) - 1, -1, -1):
+            box = pending_boxes[i]
+            c = candles_by_time[box.symbol].get(t)
+            if c is None or t < box.created_at:
+                continue
+
+            is_hit_ep = (box.direction == "long" and c.low <= box.ep) or (
+                box.direction == "short" and c.high >= box.ep
+            )
+            if not is_hit_ep:
+                continue
+
+            if len(open_positions) >= max_positions:
+                box.status = "canceled"
+                box.skip_reason = "max_positions"
+                box.resolved_at = c.open_time
+                final_boxes.append(box)
+                pending_boxes.pop(i)
+                continue
+
+            risk_amount = current_equity * (risk_per_trade / 100)
+            sl_percent = max(abs(box.ep - box.sl) / box.ep, 0.0001)
+            ideal_pos_size = risk_amount / sl_percent
+            ideal_margin = ideal_pos_size / leverage
+
+            actual_margin = min(ideal_margin, available_margin)
+            if actual_margin < 10:
+                box.status = "canceled"
+                box.skip_reason = "no_margin"
+                box.resolved_at = c.open_time
+                final_boxes.append(box)
+                pending_boxes.pop(i)
+                continue
+
+            actual_pos_size = actual_margin * leverage
+            actual_risk = actual_pos_size * sl_percent
+
+            box.is_entered = True
+            box.entered_at = c.open_time
+            box.position_size = actual_pos_size
+            box.margin_used = actual_margin
+            box.risk_amount = actual_risk
+
+            available_margin -= actual_margin
+            open_positions.append(box)
+            pending_boxes.pop(i)
+
+            is_resolved_now = False
+            is_win_now = False
+            if box.direction == "long":
+                if c.low <= box.sl:
+                    is_resolved_now, is_win_now = True, False
+                elif c.high >= box.tp:
+                    is_resolved_now, is_win_now = True, True
+            else:
+                if c.high >= box.sl:
+                    is_resolved_now, is_win_now = True, False
+                elif c.low <= box.tp:
+                    is_resolved_now, is_win_now = True, True
+
+            if is_resolved_now:
+                pnl = _resolve_pnl_and_roi(box, is_win_now, rr_ratio)
+                current_equity += pnl
+                available_margin += box.margin_used + pnl
+                total_r += rr_ratio if is_win_now else -1
+                box.status = "reacted" if is_win_now else "invalidated"
+                box.resolved_at = c.open_time
+                box.realized_pnl = pnl
+                box.realized_pnl_percent = (pnl / (current_equity - pnl)) * 100
+                final_boxes.append(box)
+                open_positions.pop()
+
+        if current_equity > peak_equity:
+            peak_equity = current_equity
+        drawdown = ((peak_equity - current_equity) / peak_equity) * 100
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+
+        curve.append(EquityPoint(time=t, pnl=total_r, equity=current_equity))
+
+    all_processed_boxes = sorted(
+        final_boxes + pending_boxes + open_positions,
+        key=lambda b: (b.symbol or "", b.start_index),
+    )
+    closed_trades = [b for b in all_processed_boxes if b.status in ("reacted", "invalidated")]
+    wins = sum(1 for b in closed_trades if b.status == "reacted")
+    win_rate = (wins / len(closed_trades) * 100) if closed_trades else 0.0
+
+    return BacktestResult(
+        boxes=all_processed_boxes,
+        curve=curve,
+        win_rate=win_rate,
+        mdd=max_drawdown,
+        wins=wins,
+        total=len(closed_trades),
+        final_equity=current_equity,
+    )
+
+
 def _to_ms(date_str: str, end_of_day: bool = False) -> int:
     dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     ms = int(dt.timestamp() * 1000)
@@ -238,7 +422,11 @@ def _parse_args() -> argparse.Namespace:
     from . import config
 
     parser = argparse.ArgumentParser(description="과거 데이터 기반 백테스트 실행")
-    parser.add_argument("--symbol", default=config.TRADING_OPTIONS.binance_symbol)
+    parser.add_argument(
+        "--symbol",
+        default=config.TRADING_OPTIONS.binance_symbol,
+        help="쉼표로 구분해 여러 심볼 지정 시 공유 자본/증거금 풀로 통합 백테스트 (예: BTCUSDT,SOLUSDT)",
+    )
     parser.add_argument("--interval", default=config.TRADING_OPTIONS.interval)
     parser.add_argument("--start", required=True, help="조회 시작일 YYYY-MM-DD")
     parser.add_argument(
@@ -256,25 +444,52 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _print_result(result: BacktestResult, capital: float) -> None:
+    print("=========================")
+    print(f"최종 자산: ${result.final_equity:,.2f} (시작: ${capital:,.2f})")
+    print(f"승률: {result.win_rate:.2f}% ({result.wins}/{result.total})")
+    print(f"MDD: {result.mdd:.2f}%")
+    print(f"감지된 타점 수: {len(result.boxes)}개")
+    print("=========================")
+
+
 def main() -> None:
     args = _parse_args()
+    symbols = [s.strip() for s in args.symbol.split(",") if s.strip()]
 
     start_ms = _to_ms(args.start)
     end_ms = _to_ms(args.end, end_of_day=True)
 
-    print(f"[백테스트] {args.symbol} {args.interval} | {args.start} ~ {args.end} 캔들 로딩 중...")
-    candles, is_mock = BinanceAPI.fetch_klines(args.symbol, args.interval, start_ms, end_ms, 1000)
+    symbol_candles: dict[str, list[Candle]] = {}
+    for symbol in symbols:
+        print(f"[백테스트] {symbol} {args.interval} | {args.start} ~ {args.end} 캔들 로딩 중...")
+        candles, is_mock = BinanceAPI.fetch_klines(symbol, args.interval, start_ms, end_ms, 1000)
+        if not candles:
+            print(f"{symbol}: 캔들 데이터를 가져오지 못했습니다.")
+            return
+        if is_mock:
+            print(f"{symbol}: 경고 - API 호출 실패로 빈 데이터가 반환되었습니다.")
+            return
+        print(f"{symbol}: 캔들 {len(candles)}개 로드 완료.")
+        symbol_candles[symbol] = candles
 
-    if not candles:
-        print("캔들 데이터를 가져오지 못했습니다.")
-        return
-    if is_mock:
-        print("경고: API 호출 실패로 빈 데이터가 반환되었습니다.")
+    if len(symbols) == 1:
+        print("백테스트 실행 중...")
+        result = run_backtest(
+            symbol_candles[symbols[0]],
+            args.interval,
+            args.rr,
+            args.capital,
+            args.risk,
+            args.leverage,
+            args.max_positions,
+        )
+        _print_result(result, args.capital)
         return
 
-    print(f"캔들 {len(candles)}개 로드 완료. 백테스트 실행 중...")
-    result = run_backtest(
-        candles,
+    print(f"공유 자본/증거금 풀로 {len(symbols)}개 심볼 통합 백테스트 실행 중 (max_positions={args.max_positions}는 전체 공유)...")
+    result = run_multi_symbol_backtest(
+        symbol_candles,
         args.interval,
         args.rr,
         args.capital,
@@ -282,12 +497,15 @@ def main() -> None:
         args.leverage,
         args.max_positions,
     )
+    _print_result(result, args.capital)
 
-    print("=========================")
-    print(f"최종 자산: ${result.final_equity:,.2f} (시작: ${args.capital:,.2f})")
-    print(f"승률: {result.win_rate:.2f}% ({result.wins}/{result.total})")
-    print(f"MDD: {result.mdd:.2f}%")
-    print(f"감지된 타점 수: {len(result.boxes)}개")
+    print("[심볼별 내역]")
+    for symbol in symbols:
+        symbol_boxes = [b for b in result.boxes if b.symbol == symbol]
+        closed = [b for b in symbol_boxes if b.status in ("reacted", "invalidated")]
+        wins = sum(1 for b in closed if b.status == "reacted")
+        win_rate = (wins / len(closed) * 100) if closed else 0.0
+        print(f"  {symbol}: 거래 {wins}/{len(closed)} (승률 {win_rate:.2f}%), 감지 타점 {len(symbol_boxes)}개")
     print("=========================")
 
 

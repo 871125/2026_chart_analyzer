@@ -72,6 +72,8 @@ class Box:
     skip_reason: Optional[Literal["max_positions", "no_margin", "sl_before_ep"]] = None
     quantity: Optional[float] = None
     entered_price: Optional[float] = None
+    # 멀티 심볼 백테스트/운영에서 이 박스가 어느 심볼(예: BTCUSDT) 소속인지 표시
+    symbol: Optional[str] = None
 
 
 class BinanceAPI:
