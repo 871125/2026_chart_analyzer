@@ -23,10 +23,11 @@ This repo has two parts: a React dashboard (`chart-analyzer`) and a standalone t
 
 ### Trading Bot (Python) — port of `./bot`
 - Path: `./bot_py`
-- Run (from repo root): `python -m bot_py.main`
+- Run live bot (from repo root): `python -m bot_py.main`
+- Run backtest (from repo root): `python -m bot_py.backtest --start YYYY-MM-DD [--end YYYY-MM-DD --symbol ... --interval ... --capital ... --risk ... --leverage ... --max-positions ... --rr ...]`
 - Deps: `pip install -r bot_py/requirements.txt`
 - Config: `bot_py/config.py` (mirrors `bot/config.ts`; gitignored, never commit real keys).
-- Rules: Keep this in sync with `./bot` when trading logic changes — the two implementations are meant to behave identically. State is persisted to `bot_py/state.json` (gitignored).
+- Rules: Keep this in sync with `./bot` when trading logic changes — the two implementations are meant to behave identically. `bot_py/backtest.py` ports the chronological simulator from `chart-analyzer/src/App.tsx` (margin/leverage tracking, multi-position handling, win-rate/MDD); keep it in sync with that too. State is persisted to `bot_py/state.json` (gitignored).
 
 ## 3. CI/CD Automation Mode
 - If `CI=true`, do not generate interactive questions. Execute the prompt and terminate.
