@@ -245,6 +245,7 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
 
         side = "BUY" if box.direction == "long" else "SELL"
         symbol_info = binance_client.get_symbol_info(config.TRADING_OPTIONS.binance_symbol)
+        leverage = config.TRADING_OPTIONS.leverage
 
         current_capital = config.TRADING_OPTIONS.capital
         try:
@@ -252,13 +253,37 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
         except Exception as balance_err:
             print(f"[잔고 조회 실패] 설정된 기본 CAPITAL(${current_capital})을 사용합니다: {balance_err}")
 
+        available_margin = current_capital
+        try:
+            available_margin = binance_client.get_available_margin("USDT")
+        except Exception as margin_err:
+            print(f"[가용 증거금 조회 실패] 총 잔고(${available_margin})를 그대로 사용합니다: {margin_err}")
+
         risk_amount = current_capital * (config.TRADING_OPTIONS.risk_per_trade / 100)
         sl_percent = max(abs(box.ep - box.sl) / box.ep, 0.0001)
         ideal_pos_size_usd = risk_amount / sl_percent
+        ideal_margin = ideal_pos_size_usd / leverage
 
-        if ideal_pos_size_usd < symbol_info["min_notional"]:
+        # 다른 오픈 포지션이 이미 증거금을 쓰고 있으면, 남은 가용 증거금 한도 내로 포지션을 축소한다
+        # (backtest.py의 시뮬레이션과 동일한 규칙: 최소 증거금 $10 미만이면 진입 스킵).
+        actual_margin = min(ideal_margin, available_margin)
+        if actual_margin < 10:
             send_telegram_message(
-                f"[진입 스킵] 계산된 포지션 규모(${ideal_pos_size_usd:.2f})가 "
+                f"[진입 스킵] 가용 증거금(${available_margin:.2f})이 부족합니다. "
+                f"필요 증거금: ${ideal_margin:.2f}"
+            )
+            active_positions.append(box)
+            if len(active_positions) > 50:
+                active_positions.pop(0)
+            pending_boxes.pop(i)
+            state_changed = True
+            continue
+
+        actual_pos_size_usd = actual_margin * leverage
+
+        if actual_pos_size_usd < symbol_info["min_notional"]:
+            send_telegram_message(
+                f"[진입 스킵] 계산된 포지션 규모(${actual_pos_size_usd:.2f})가 "
                 f"바이낸스 최소 주문금액(${symbol_info['min_notional']})보다 작습니다."
             )
             active_positions.append(box)
@@ -268,7 +293,10 @@ def _process_pending_boxes(current_candle, current_price: float) -> bool:
             state_changed = True
             continue
 
-        quantity = round(ideal_pos_size_usd / current_price, symbol_info["quantity_precision"])
+        quantity = round(actual_pos_size_usd / current_price, symbol_info["quantity_precision"])
+        box.margin_used = actual_margin
+        box.position_size = actual_pos_size_usd
+        box.risk_amount = actual_pos_size_usd * sl_percent
 
         try:
             order_result = binance_client.place_entry_order(

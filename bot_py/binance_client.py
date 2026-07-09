@@ -149,3 +149,19 @@ def get_account_balance(asset: str = "USDT") -> float:
         return float(target["balance"]) if target else 0.0
     except Exception as error:
         raise RuntimeError(f"계좌 잔고 조회 실패: {error}") from error
+
+
+def get_available_margin(asset: str = "USDT") -> float:
+    """신규 포지션 진입에 사용할 수 있는 가용 증거금(availableBalance)을 조회합니다.
+
+    get_account_balance()가 반환하는 총 지갑 잔고(balance)와 달리, 이미 다른
+    포지션에 사용 중인 증거금은 제외된 값입니다.
+    """
+    try:
+        balances = _signed_request("GET", "/fapi/v2/balance")
+        if not isinstance(balances, list):
+            raise RuntimeError("잔고 정보가 올바른 배열 형태가 아닙니다.")
+        target = next((b for b in balances if b.get("asset") == asset), None)
+        return float(target["availableBalance"]) if target else 0.0
+    except Exception as error:
+        raise RuntimeError(f"가용 증거금 조회 실패: {error}") from error
