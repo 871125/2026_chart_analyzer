@@ -248,7 +248,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--capital", type=float, default=config.TRADING_OPTIONS.capital)
     parser.add_argument(
-        "--risk", type=float, default=config.TRADING_OPTIONS.risk_per_trade, help="1회 거래당 리스크 (%)"
+        "--risk", type=float, default=config.TRADING_OPTIONS.risk_per_trade, help="1회 거래당 리스크 (%%)"
     )
     parser.add_argument("--leverage", type=float, default=config.TRADING_OPTIONS.leverage)
     parser.add_argument("--max-positions", type=int, default=config.TRADING_OPTIONS.max_positions)
