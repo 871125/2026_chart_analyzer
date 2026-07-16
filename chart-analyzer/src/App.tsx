@@ -5,7 +5,7 @@ import { Activity, TrendingUp, TrendingDown, AlertCircle, RefreshCw, Box as BoxI
 // 1. 코어 엔진 로직
 // ==========================================
 
-export type CandleInterval = '1h' | '4h' | '1d';
+export type CandleInterval = '5m' | '15m' | '1h' | '4h' | '1d';
 export type ZoneType = 'order_block' | 'volume_zone' | 'sideways_box';
 export type StrategyStatus = 'active' | 'reacted' | 'invalidated' | 'canceled';
 
@@ -241,7 +241,8 @@ class Indicators {
 }
 
 class SidewaysBoxDetector {
-    private readonly PASS_THRESHOLD = 70;
+    // private readonly PASS_THRESHOLD = 70;
+    private readonly PASS_THRESHOLD = 65;
 
     public detect(candles: Candle[], interval: CandleInterval, rrRatio: number): Box[] {
         const boxes: Box[] = [];
@@ -299,20 +300,45 @@ class SidewaysBoxDetector {
         return true;
     }
 
+    // private determineArchetype(candles: Candle[], startIdx: number, bIdx: number, len: number, interval: CandleInterval, dir: 'long'|'short'): Box['archetype'] {
+    //     const c1 = candles[bIdx - 2]; const c2 = candles[bIdx - 1];
+    //     if (len >= 10 && Indicators.hasVolumeExpansion(candles, bIdx - 1)) {
+    //         let hasReversalSign = false;
+    //         for(let k = startIdx; k < bIdx; k++) {
+    //             if (Indicators.isPinbar(candles[k])) { hasReversalSign = true; break; }
+    //             if (k > startIdx && Indicators.isEngulfing(candles[k-1], candles[k])) { hasReversalSign = true; break; }
+    //         }
+    //         if (hasReversalSign) return 'turning_point_base';
+    //     }
+    //     if (len >= 10 && c1 && c2 && c1.isBullish !== c2.isBullish && Indicators.isEngulfing(c1, c2)) return 'breakout_prep_box';
+        
+    //     if (interval === '1h' && len >= 10 && len <= 40) return 'continuation_box';
+    //     if (interval === '4h' && len >= 5 && len <= 15) return 'continuation_box';
+    //     if (interval === '1d' && len >= 1 && len <= 3) return 'continuation_box';
+    //     return 'unknown';
+    // }
+
+
     private determineArchetype(candles: Candle[], startIdx: number, bIdx: number, len: number, interval: CandleInterval, dir: 'long'|'short'): Box['archetype'] {
         const c1 = candles[bIdx - 2]; const c2 = candles[bIdx - 1];
+        
         if (len >= 10 && Indicators.hasVolumeExpansion(candles, bIdx - 1)) {
             let hasReversalSign = false;
-            for(let k = startIdx; k < bIdx; k++) {
-                if (Indicators.isPinbar(candles[k])) { hasReversalSign = true; break; }
-                if (k > startIdx && Indicators.isEngulfing(candles[k-1], candles[k])) { hasReversalSign = true; break; }
-            }
+            for(let k = startIdx; k < bIdx; k++) { if (Indicators.isPinbar(candles[k]) || (k > startIdx && Indicators.isEngulfing(candles[k-1], candles[k]))) { hasReversalSign = true; break; } }
             if (hasReversalSign) return 'turning_point_base';
         }
+        
         if (len >= 10 && c1 && c2 && c1.isBullish !== c2.isBullish && Indicators.isEngulfing(c1, c2)) return 'breakout_prep_box';
-        if (interval === '1h' && len >= 10 && len <= 40) return 'continuation_box';
-        if (interval === '4h' && len >= 5 && len <= 15) return 'continuation_box';
-        if (interval === '1d' && len >= 1 && len <= 3) return 'continuation_box';
+        
+        // 이 부분을 수정합니다. (5분봉, 15분봉 로직 추가)
+        if (
+            (interval === '5m' && len >= 15 && len <= 60) ||   // 5분봉: 최소 1시간 15분 ~ 최대 5시간 횡보
+            (interval === '15m' && len >= 10 && len <= 40) ||  // 15분봉: 최소 2.5시간 ~ 최대 10시간 횡보
+            (interval === '1h' && len >= 10 && len <= 40) || 
+            (interval === '4h' && len >= 5 && len <= 15) || 
+            (interval === '1d' && len >= 1 && len <= 3)
+        ) return 'continuation_box';
+        
         return 'unknown';
     }
 
@@ -977,6 +1003,8 @@ export default function App() {
                             <option value="SOLUSDT">SOL/USDT</option>
                         </select>
                         <select value={interval} onChange={(e) => setInterval(e.target.value as CandleInterval)} className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500">
+                            <option value="5m">5 Min</option>
+                            <option value="15m">15 Min</option>
                             <option value="1h">1 Hour</option>
                             <option value="4h">4 Hours</option>
                             <option value="1d">1 Day</option>
