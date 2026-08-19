@@ -115,6 +115,60 @@ def place_entry_order(symbol: str, side: str, quantity: float) -> Any:
     )
 
 
+def place_limit_entry_order(symbol: str, side: str, quantity: float, price: float) -> Any:
+    """지정가(포스트온리) 신규 진입 주문.
+
+    timeInForce=GTX는 메이커로만 체결되는 주문으로, 즉시 체결될 가격이면 주문
+    자체가 거부(EXPIRED)된다. 덕분에 테이커 수수료를 낼 일이 없고 EP에 정확히
+    체결되지만, 가격이 EP를 스쳐 지나가면 체결되지 않을 수 있다.
+    """
+    position_side = "LONG" if side == "BUY" else "SHORT"
+    info = get_symbol_info(symbol)
+    return _signed_request(
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "LIMIT",
+            "timeInForce": "GTX",
+            "quantity": f"{quantity:.{info['quantity_precision']}f}",
+            "price": f"{price:.{info['price_precision']}f}",
+        },
+    )
+
+
+def place_limit_close_order(
+    symbol: str, position_side: str, quantity: float, price: float
+) -> Any:
+    """지정가(포스트온리) 청산 주문. 익절(TP) 지점에 미리 걸어두는 용도."""
+    side = "SELL" if position_side == "LONG" else "BUY"
+    info = get_symbol_info(symbol)
+    return _signed_request(
+        "POST",
+        "/fapi/v1/order",
+        {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": "LIMIT",
+            "timeInForce": "GTX",
+            "quantity": f"{quantity:.{info['quantity_precision']}f}",
+            "price": f"{price:.{info['price_precision']}f}",
+        },
+    )
+
+
+def get_order(symbol: str, order_id: int) -> Any:
+    """주문 상태 조회. status는 NEW/PARTIALLY_FILLED/FILLED/CANCELED/EXPIRED 등."""
+    return _signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+
+
+def cancel_order(symbol: str, order_id: int) -> Any:
+    return _signed_request("DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+
+
 def place_close_order(symbol: str, position_side: str, quantity: float) -> Any:
     side = "SELL" if position_side == "LONG" else "BUY"
     info = get_symbol_info(symbol)

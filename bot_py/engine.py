@@ -69,11 +69,22 @@ class Box:
     position_size: Optional[float] = None
     risk_amount: Optional[float] = None
     margin_used: Optional[float] = None
-    skip_reason: Optional[Literal["max_positions", "no_margin", "sl_before_ep"]] = None
+    skip_reason: Optional[
+        Literal[
+            "max_positions",
+            "no_margin",
+            "sl_before_ep",
+            "stop_too_tight",
+            "same_direction_cap",
+        ]
+    ] = None
     quantity: Optional[float] = None
     entered_price: Optional[float] = None
     # 멀티 심볼 백테스트/운영에서 이 박스가 어느 심볼(예: BTCUSDT) 소속인지 표시
     symbol: Optional[str] = None
+    # 지정가(메이커) 운용 시 EP에 걸어둔 진입 주문 / TP에 걸어둔 청산 주문 ID
+    entry_order_id: Optional[int] = None
+    tp_order_id: Optional[int] = None
 
 
 class BinanceAPI:

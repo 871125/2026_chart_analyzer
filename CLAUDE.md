@@ -25,8 +25,11 @@ This repo has two parts: a React dashboard (`chart-analyzer`) and a standalone t
 - Path: `./bot_py`
 - Run live bot (from repo root): `python -m bot_py.main`
 - Run backtest (from repo root): `python -m bot_py.backtest --start YYYY-MM-DD [--end YYYY-MM-DD --symbol ... --interval ... --capital ... --risk ... --leverage ... --max-positions ... --rr ...]`
+- Backtest cost/filter flags: `--entry-mode {taker,maker}`, `--fee-rate`, `--maker-fee-rate`, `--slippage-pct`, `--min-stop-pct`, `--max-same-direction`, `--intrabar {loss,skip}`
 - Deps: `pip install -r bot_py/requirements.txt`
 - Config: `bot_py/config.py` (mirrors `bot/config.ts`; gitignored, never commit real keys).
+- Entry mode: both the live bot (`config.TRADING_OPTIONS.entry_mode`, default `maker`) and the backtest (`--entry-mode`) support post-only limit entry at EP + limit TP exit, with SL always market. Keep the two in sync when changing fill logic.
+- `--intrabar` note: when a single candle touches both EP and SL, `loss` (default) books it as an entry-then-stop, `skip` restores the old behavior that recorded no trade at all. The old behavior overstated win rate by ~9%p.
 - Rules: `bot_py` has diverged from `./bot` on purpose — it now trades multiple symbols (`config.TRADING_OPTIONS.binance_symbols`) against one shared capital/margin pool instead of a single symbol (`./bot` still trades one symbol only). Don't assume the two stay in sync; `./bot` is legacy/reference only per user instruction. `bot_py/backtest.py` has both `run_backtest()` (single symbol) and `run_multi_symbol_backtest()` (shared pool, used when `--symbol` gets a comma-separated list). State is persisted to `bot_py/state.json` (gitignored).
 
 ## 3. CI/CD Automation Mode

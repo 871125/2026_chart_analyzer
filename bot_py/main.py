@@ -25,6 +25,11 @@ from .telegram_notifier import send_telegram_message
 
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
 
+# 진입/청산 체결 방식. "maker"는 EP에 포스트온리 지정가 주문을 미리 걸어두고
+# 익절도 TP 지정가로 처리한다(손절만 시장가). "taker"는 EP 터치 시 시장가 진입.
+# config.TRADING_OPTIONS.entry_mode로 덮어쓸 수 있다.
+ENTRY_MODE: str = getattr(config.TRADING_OPTIONS, "entry_mode", "maker")
+
 pending_boxes: list[Box] = []
 active_positions: list[Box] = []
 open_positions: list[Box] = []
@@ -101,6 +106,7 @@ def run_bot() -> None:
         "퀀트 자동 매매 봇 부팅 완료\n"
         f"- 거래 페어(공유 풀): {symbols_label}\n"
         f"- 레버리지: {config.TRADING_OPTIONS.leverage}x\n"
+        f"- 진입 방식: {'지정가(메이커)' if ENTRY_MODE == 'maker' else '시장가(테이커)'}\n"
         f"- 차트 주기: {config.TRADING_OPTIONS.interval}\n"
         f"- Check 간격: {config.CHECK_INTERVAL_SEC}초\n"
         "=========================\n"
@@ -225,7 +231,268 @@ def check_market() -> None:
         print(f"[에러] Market check error: {error}")
 
 
-def _process_pending_boxes(latest_candles: dict[str, Candle], latest_prices: dict[str, float]) -> bool:
+def _retire_box(box: Box, index: int) -> None:
+    """대기 타점을 목록에서 빼고 중복 진입 방지 이력(active_positions)에 남긴다."""
+    active_positions.append(box)
+    if len(active_positions) > 50:
+        active_positions.pop(0)
+    pending_boxes.pop(index)
+
+
+def _build_entry_plan(
+    box: Box, reference_price: float
+) -> tuple[Optional[dict[str, float]], Optional[str]]:
+    """리스크 기반 포지션 규모를 계산한다. 진입 불가 시 (None, 사유)를 돌려준다.
+
+    다른 심볼의 오픈 포지션이 이미 증거금을 쓰고 있으면 남은 가용 증거금 한도
+    내로 포지션을 축소한다 (backtest.py의 run_multi_symbol_backtest와 동일한
+    규칙: 최소 증거금 $10 미만이면 진입 스킵).
+    """
+    symbol_info = binance_client.get_symbol_info(box.symbol)
+    leverage = config.TRADING_OPTIONS.leverage
+
+    current_capital = config.TRADING_OPTIONS.capital
+    try:
+        current_capital = binance_client.get_account_balance("USDT")
+    except Exception as balance_err:
+        print(f"[잔고 조회 실패] 설정된 기본 CAPITAL(${current_capital})을 사용합니다: {balance_err}")
+
+    available_margin = current_capital
+    try:
+        available_margin = binance_client.get_available_margin("USDT")
+    except Exception as margin_err:
+        print(f"[가용 증거금 조회 실패] 총 잔고(${available_margin})를 그대로 사용합니다: {margin_err}")
+
+    risk_amount = current_capital * (config.TRADING_OPTIONS.risk_per_trade / 100)
+    sl_percent = max(abs(box.ep - box.sl) / box.ep, 0.0001)
+    ideal_pos_size_usd = risk_amount / sl_percent
+    ideal_margin = ideal_pos_size_usd / leverage
+
+    actual_margin = min(ideal_margin, available_margin)
+    if actual_margin < 10:
+        return None, (
+            f"가용 증거금(${available_margin:.2f})이 부족합니다. 필요 증거금: ${ideal_margin:.2f}"
+        )
+
+    actual_pos_size_usd = actual_margin * leverage
+    if actual_pos_size_usd < symbol_info["min_notional"]:
+        return None, (
+            f"계산된 포지션 규모(${actual_pos_size_usd:.2f})가 "
+            f"바이낸스 최소 주문금액(${symbol_info['min_notional']})보다 작습니다."
+        )
+
+    quantity = round(actual_pos_size_usd / reference_price, symbol_info["quantity_precision"])
+    if quantity <= 0:
+        return None, "계산된 주문 수량이 0입니다."
+
+    return (
+        {
+            "quantity": quantity,
+            "margin": actual_margin,
+            "notional": actual_pos_size_usd,
+            "risk": actual_pos_size_usd * sl_percent,
+        },
+        None,
+    )
+
+
+def _reserved_slot_count() -> int:
+    """EP에 지정가 주문을 걸어둔(=곧 포지션이 될) 대기 타점 수."""
+    return sum(1 for b in pending_boxes if b.entry_order_id is not None)
+
+
+def _place_tp_order(box: Box) -> None:
+    """익절 지점에 포스트온리 지정가 청산 주문을 건다.
+
+    실패해도 치명적이지 않다. tp_order_id가 None이면 _process_open_positions가
+    기존과 동일하게 가격을 감시해 시장가로 청산한다.
+    """
+    position_side = "LONG" if box.direction == "long" else "SHORT"
+    try:
+        result = binance_client.place_limit_close_order(
+            box.symbol, position_side, box.quantity or 0, box.tp
+        )
+        box.tp_order_id = result.get("orderId")
+    except Exception as error:
+        box.tp_order_id = None
+        print(f"[TP 지정가 주문 실패] [{box.symbol}] {error} -> 가격 감시 후 시장가로 청산합니다.")
+
+
+def _cancel_tp_order(box: Box) -> None:
+    if box.tp_order_id is None:
+        return
+    try:
+        binance_client.cancel_order(box.symbol, box.tp_order_id)
+    except Exception as error:
+        print(f"[TP 주문 취소 실패] [{box.symbol}] {error}")
+    box.tp_order_id = None
+
+
+def _process_pending_boxes(
+    latest_candles: dict[str, Candle], latest_prices: dict[str, float]
+) -> bool:
+    if ENTRY_MODE == "maker":
+        return _process_pending_boxes_maker(latest_candles, latest_prices)
+    return _process_pending_boxes_taker(latest_candles, latest_prices)
+
+
+def _process_pending_boxes_maker(
+    latest_candles: dict[str, Candle], latest_prices: dict[str, float]
+) -> bool:
+    """EP에 포스트온리(GTX) 지정가 주문을 미리 걸어두고 체결을 기다린다.
+
+    시장가 진입과 달리 EP에 정확히 체결되고 메이커 수수료만 낸다. 대신 가격이
+    EP를 스치고 지나가면 체결되지 않을 수 있다 (백테스트 --entry-mode maker와
+    같은 모델). 손절만은 지정가로 걸 수 없어 기존처럼 시장가로 처리한다.
+    """
+    global pending_boxes, active_positions, open_positions
+    state_changed = False
+
+    for i in range(len(pending_boxes) - 1, -1, -1):
+        box = pending_boxes[i]
+        current_candle = latest_candles.get(box.symbol)
+        current_price = latest_prices.get(box.symbol)
+        if current_candle is None or current_price is None:
+            continue  # 이번 주기엔 해당 심볼 캔들을 못 받아옴 -> 다음 주기에 재시도
+
+        hit_sl_before_entry = (box.direction == "long" and current_candle.low <= box.sl) or (
+            box.direction == "short" and current_candle.high >= box.sl
+        )
+
+        # 1. 이미 EP에 주문을 걸어둔 타점 -> 체결 여부 확인
+        if box.entry_order_id is not None:
+            try:
+                order = binance_client.get_order(box.symbol, box.entry_order_id)
+            except Exception as api_err:
+                print(f"[주문 조회 실패] [{box.symbol}] {api_err}")
+                continue
+
+            status = str(order.get("status"))
+            filled_qty = float(order.get("executedQty") or 0)
+
+            if status == "FILLED":
+                avg_price = float(order.get("avgPrice") or box.ep)
+                box.is_entered = True
+                box.entered_at = int(time.time() * 1000)
+                box.entered_price = avg_price
+                box.quantity = filled_qty
+                box.entry_order_id = None
+                open_positions.append(box)
+                _retire_box(box, i)
+                _place_tp_order(box)
+                send_telegram_message(
+                    f"[지정가 체결] [{box.symbol}] {box.direction.upper()} 포지션 진입!\n"
+                    f"진입가격: {avg_price:.2f} (EP: {box.ep:.2f})\n"
+                    f"설정된 TP: {box.tp:.2f} / SL: {box.sl:.2f}\n"
+                    f"주문수량: {filled_qty}\n"
+                    f"TP 지정가 주문: {'접수됨' if box.tp_order_id else '실패(가격 감시로 대체)'}"
+                )
+                state_changed = True
+                continue
+
+            if hit_sl_before_entry:
+                # 체결을 기다리는 사이 SL이 깨졌다 -> 주문 취소. 일부만 체결됐다면
+                # 그 물량은 시장가로 즉시 정리한다.
+                try:
+                    binance_client.cancel_order(box.symbol, box.entry_order_id)
+                except Exception as cancel_err:
+                    print(f"[진입 주문 취소 실패] [{box.symbol}] {cancel_err}")
+                box.entry_order_id = None
+
+                if filled_qty > 0:
+                    position_side = "LONG" if box.direction == "long" else "SHORT"
+                    try:
+                        binance_client.place_close_order(box.symbol, position_side, filled_qty)
+                        send_telegram_message(
+                            f"[타점 취소] [{box.symbol}] 체결 대기 중 SL 도달. "
+                            f"부분 체결분 {filled_qty}을 시장가로 정리했습니다."
+                        )
+                    except Exception as close_err:
+                        send_telegram_message(
+                            f"[긴급] [{box.symbol}] 부분 체결분 {filled_qty} 정리 실패. "
+                            f"수동 확인이 필요합니다!\n오류: {close_err}"
+                        )
+                else:
+                    send_telegram_message(
+                        f"[타점 취소] [{box.symbol}] 체결 전 SL 먼저 터치됨. 대상 EP: {box.ep:.2f}"
+                    )
+
+                _retire_box(box, i)
+                state_changed = True
+                continue
+
+            if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                # GTX는 즉시 체결될 가격이면 거부된다 -> 주문 정보만 비우고 다음 주기 재시도
+                box.entry_order_id = None
+                state_changed = True
+
+            continue  # NEW / PARTIALLY_FILLED는 계속 대기
+
+        # 2. 아직 주문이 없는 타점
+        if hit_sl_before_entry:
+            send_telegram_message(
+                f"[타점 취소] [{box.symbol}] 주문 접수 전 SL 먼저 터치됨. 대상 EP: {box.ep:.2f}"
+            )
+            _retire_box(box, i)
+            state_changed = True
+            continue
+
+        try:
+            position_count = binance_client.get_active_positions_count()
+        except Exception as api_err:
+            print(f"[Binance 포지션 개수 조회 실패]: {api_err}")
+            continue
+
+        # 지정가 주문은 EP 도달 전에 미리 걸어두므로, 걸어둔 주문도 자리를 차지한 것으로 센다.
+        if position_count + _reserved_slot_count() >= config.TRADING_OPTIONS.max_positions:
+            # 시장가 모드와 달리 타점을 폐기하지 않는다. 자리가 나면 다음 주기에 주문을 건다.
+            print(f"[주문 보류] [{box.symbol}] 포지션/대기주문이 최대치입니다.")
+            continue
+
+        plan, skip_reason = _build_entry_plan(box, box.ep)
+        if plan is None:
+            print(f"[주문 보류] [{box.symbol}] {skip_reason}")
+            continue
+
+        side = "BUY" if box.direction == "long" else "SELL"
+        try:
+            order_result = binance_client.place_limit_entry_order(
+                box.symbol, side, plan["quantity"], box.ep
+            )
+        except Exception as e:
+            message = str(e)
+            # -5022: 즉시 체결될 가격이라 GTX 주문이 거부됨 (현재가가 EP를 이미 지나침)
+            if "-5022" in message or "-2010" in message:
+                print(f"[주문 보류] [{box.symbol}] 현재가가 EP를 지나 메이커 주문이 거부됨. 다음 주기 재시도")
+                continue
+            send_telegram_message(
+                f"[주문 실패] [{box.symbol}] Binance API 오류: {e}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)"
+            )
+            print(f"[Binance 주문 에러 상세]: {e}")
+            _retire_box(box, i)
+            state_changed = True
+            continue
+
+        box.entry_order_id = order_result.get("orderId")
+        box.quantity = plan["quantity"]
+        box.margin_used = plan["margin"]
+        box.position_size = plan["notional"]
+        box.risk_amount = plan["risk"]
+        send_telegram_message(
+            f"[지정가 주문 접수] [{box.symbol}] {box.direction.upper()}\n"
+            f"EP(지정가): {box.ep:.2f} / TP: {box.tp:.2f} / SL: {box.sl:.2f}\n"
+            f"주문수량: {plan['quantity']}\n"
+            f"주문번호: {box.entry_order_id}"
+        )
+        state_changed = True
+
+    return state_changed
+
+
+def _process_pending_boxes_taker(
+    latest_candles: dict[str, Candle], latest_prices: dict[str, float]
+) -> bool:
+    """기존 방식: EP 터치를 감지하면 시장가로 즉시 진입한다."""
     global pending_boxes, active_positions, open_positions
     state_changed = False
 
@@ -240,11 +507,10 @@ def _process_pending_boxes(latest_candles: dict[str, Candle], latest_prices: dic
             box.direction == "short" and current_candle.high >= box.sl
         )
         if hit_sl_before_entry:
-            send_telegram_message(f"[타점 취소] [{box.symbol}] EP 도달 전 SL 먼저 터치됨. 대상 타점: {box.ep:.2f}")
-            active_positions.append(box)
-            if len(active_positions) > 50:
-                active_positions.pop(0)
-            pending_boxes.pop(i)
+            send_telegram_message(
+                f"[타점 취소] [{box.symbol}] EP 도달 전 SL 먼저 터치됨. 대상 타점: {box.ep:.2f}"
+            )
+            _retire_box(box, i)
             state_changed = True
             continue
 
@@ -265,69 +531,23 @@ def _process_pending_boxes(latest_candles: dict[str, Candle], latest_prices: dic
                 f"[진입 스킵] [{box.symbol}] Binance 거래소에 유지 중인 포지션이 최대치"
                 f"({config.TRADING_OPTIONS.max_positions}개)입니다."
             )
-            active_positions.append(box)
-            if len(active_positions) > 50:
-                active_positions.pop(0)
-            pending_boxes.pop(i)
+            _retire_box(box, i)
             state_changed = True
             continue
+
+        plan, skip_reason = _build_entry_plan(box, current_price)
+        if plan is None:
+            send_telegram_message(f"[진입 스킵] [{box.symbol}] {skip_reason}")
+            _retire_box(box, i)
+            state_changed = True
+            continue
+
+        quantity = plan["quantity"]
+        box.margin_used = plan["margin"]
+        box.position_size = plan["notional"]
+        box.risk_amount = plan["risk"]
 
         side = "BUY" if box.direction == "long" else "SELL"
-        symbol_info = binance_client.get_symbol_info(box.symbol)
-        leverage = config.TRADING_OPTIONS.leverage
-
-        current_capital = config.TRADING_OPTIONS.capital
-        try:
-            current_capital = binance_client.get_account_balance("USDT")
-        except Exception as balance_err:
-            print(f"[잔고 조회 실패] 설정된 기본 CAPITAL(${current_capital})을 사용합니다: {balance_err}")
-
-        available_margin = current_capital
-        try:
-            available_margin = binance_client.get_available_margin("USDT")
-        except Exception as margin_err:
-            print(f"[가용 증거금 조회 실패] 총 잔고(${available_margin})를 그대로 사용합니다: {margin_err}")
-
-        risk_amount = current_capital * (config.TRADING_OPTIONS.risk_per_trade / 100)
-        sl_percent = max(abs(box.ep - box.sl) / box.ep, 0.0001)
-        ideal_pos_size_usd = risk_amount / sl_percent
-        ideal_margin = ideal_pos_size_usd / leverage
-
-        # 다른 심볼의 오픈 포지션이 이미 증거금을 쓰고 있으면, 남은 가용 증거금 한도 내로
-        # 포지션을 축소한다 (backtest.py의 run_multi_symbol_backtest와 동일한 규칙:
-        # 최소 증거금 $10 미만이면 진입 스킵).
-        actual_margin = min(ideal_margin, available_margin)
-        if actual_margin < 10:
-            send_telegram_message(
-                f"[진입 스킵] [{box.symbol}] 가용 증거금(${available_margin:.2f})이 부족합니다. "
-                f"필요 증거금: ${ideal_margin:.2f}"
-            )
-            active_positions.append(box)
-            if len(active_positions) > 50:
-                active_positions.pop(0)
-            pending_boxes.pop(i)
-            state_changed = True
-            continue
-
-        actual_pos_size_usd = actual_margin * leverage
-
-        if actual_pos_size_usd < symbol_info["min_notional"]:
-            send_telegram_message(
-                f"[진입 스킵] [{box.symbol}] 계산된 포지션 규모(${actual_pos_size_usd:.2f})가 "
-                f"바이낸스 최소 주문금액(${symbol_info['min_notional']})보다 작습니다."
-            )
-            active_positions.append(box)
-            if len(active_positions) > 50:
-                active_positions.pop(0)
-            pending_boxes.pop(i)
-            state_changed = True
-            continue
-
-        quantity = round(actual_pos_size_usd / current_price, symbol_info["quantity_precision"])
-        box.margin_used = actual_margin
-        box.position_size = actual_pos_size_usd
-        box.risk_amount = actual_pos_size_usd * sl_percent
-
         try:
             order_result = binance_client.place_entry_order(box.symbol, side, quantity)
             send_telegram_message(
@@ -338,24 +558,19 @@ def _process_pending_boxes(latest_candles: dict[str, Candle], latest_prices: dic
                 f"주문번호: {order_result.get('orderId', '확인불가')}"
             )
             box.is_entered = True
+            box.entered_at = int(time.time() * 1000)
             box.entered_price = current_price
             box.quantity = quantity
 
             open_positions.append(box)
-            active_positions.append(box)
-            if len(active_positions) > 50:
-                active_positions.pop(0)
-            pending_boxes.pop(i)
+            _retire_box(box, i)
             state_changed = True
         except Exception as e:
             send_telegram_message(
                 f"[주문 실패] [{box.symbol}] Binance API 오류: {e}\n(해당 타점은 무한 재시도를 막기 위해 폐기됩니다)"
             )
             print(f"[Binance 주문 에러 상세]: {e}")
-            active_positions.append(box)
-            if len(active_positions) > 50:
-                active_positions.pop(0)
-            pending_boxes.pop(i)
+            _retire_box(box, i)
             state_changed = True
 
     return state_changed
@@ -371,26 +586,55 @@ def _process_open_positions(latest_prices: dict[str, float]) -> bool:
         if current_price is None:
             continue  # 이번 주기엔 해당 심볼 캔들을 못 받아옴 -> 다음 주기에 재시도
 
+        # 1. TP를 지정가로 걸어둔 포지션은 그 주문의 체결 여부부터 확인한다.
+        if pos.tp_order_id is not None:
+            try:
+                order = binance_client.get_order(pos.symbol, pos.tp_order_id)
+            except Exception as api_err:
+                print(f"[TP 주문 조회 실패] [{pos.symbol}] {api_err}")
+            else:
+                status = str(order.get("status"))
+                if status == "FILLED":
+                    send_telegram_message(
+                        f"[TP 청산] [{pos.symbol}] {pos.direction.upper()} 포지션 종료 (지정가)\n"
+                        f"진입가: {(pos.entered_price or 0):.2f}\n"
+                        f"청산가: {float(order.get('avgPrice') or pos.tp):.2f}\n"
+                        f"수량: {pos.quantity}"
+                    )
+                    pos.tp_order_id = None
+                    open_positions.pop(i)
+                    state_changed = True
+                    continue
+                if status in ("CANCELED", "EXPIRED", "REJECTED"):
+                    # 주문이 사라졌으면 아래 가격 감시 로직이 시장가로 대신 처리한다.
+                    pos.tp_order_id = None
+                    state_changed = True
+
+        # 2. 손절은 지정가로 걸 수 없으므로 가격을 감시해 시장가로 청산한다.
+        #    TP 지정가 주문이 살아 있으면 익절은 그쪽에 맡기고 SL만 확인한다.
         is_resolved = False
         resolution_type: Optional[str] = None
+        tp_is_resting = pos.tp_order_id is not None
 
         if pos.direction == "long":
             if current_price <= pos.sl:
                 is_resolved, resolution_type = True, "SL"
-            elif current_price >= pos.tp:
+            elif not tp_is_resting and current_price >= pos.tp:
                 is_resolved, resolution_type = True, "TP"
         else:
             if current_price >= pos.sl:
                 is_resolved, resolution_type = True, "SL"
-            elif current_price <= pos.tp:
+            elif not tp_is_resting and current_price <= pos.tp:
                 is_resolved, resolution_type = True, "TP"
 
         if is_resolved and pos.quantity:
             try:
                 position_side = "LONG" if pos.direction == "long" else "SHORT"
+                # 남아 있는 TP 지정가 주문을 먼저 취소해야 중복 청산이 나지 않는다.
+                _cancel_tp_order(pos)
                 binance_client.place_close_order(pos.symbol, position_side, pos.quantity)
                 send_telegram_message(
-                    f"[{resolution_type} 청산] [{pos.symbol}] {pos.direction.upper()} 포지션 종료\n"
+                    f"[{resolution_type} 청산] [{pos.symbol}] {pos.direction.upper()} 포지션 종료 (시장가)\n"
                     f"진입가: {(pos.entered_price or 0):.2f}\n"
                     f"청산가: {current_price:.2f}\n"
                     f"수량: {pos.quantity}"

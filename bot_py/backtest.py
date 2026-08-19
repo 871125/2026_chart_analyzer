@@ -12,6 +12,7 @@ chart-analyzer/src/App.tsx의 시계열 시뮬레이터(마진/레버리지 추�
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -36,8 +37,77 @@ class BacktestResult:
     final_equity: float
 
 
-def _resolve_pnl_and_roi(box: Box, is_win: bool, rr_ratio: float) -> float:
+@dataclass(frozen=True)
+class CostModel:
+    """체결 비용 모델. 모든 값은 명목 규모(position_size) 대비 %.
+
+    진입/청산 각 구간의 수수료와 슬리피지를 따로 잡는다. 지정가(메이커) 진입은
+    수수료가 싸고 EP에 정확히 체결되므로 진입 슬리피지가 0이지만, 손절은 지정가로
+    낼 수 없어 시장가(테이커) + 슬리피지가 그대로 남는다.
+    """
+
+    entry_fee_pct: float = 0.0
+    exit_fee_win_pct: float = 0.0
+    exit_fee_loss_pct: float = 0.0
+    entry_slippage_pct: float = 0.0
+    exit_slippage_pct: float = 0.0
+
+    @classmethod
+    def taker(cls, fee_pct: float = 0.05, slippage_pct: float = 0.0) -> "CostModel":
+        """현행: 진입/청산 모두 시장가."""
+        return cls(fee_pct, fee_pct, fee_pct, slippage_pct, slippage_pct)
+
+    @classmethod
+    def maker_entry(
+        cls, maker_pct: float = 0.02, taker_pct: float = 0.05, slippage_pct: float = 0.0
+    ) -> "CostModel":
+        """지정가 진입 + TP 지정가 청산 + SL 시장가 청산.
+
+        SL은 스탑 주문이라 메이커가 될 수 없으므로 손절 시에만 테이커 수수료와
+        슬리피지를 부담한다.
+        """
+        return cls(
+            entry_fee_pct=maker_pct,
+            exit_fee_win_pct=maker_pct,
+            exit_fee_loss_pct=taker_pct,
+            entry_slippage_pct=0.0,
+            exit_slippage_pct=slippage_pct,
+        )
+
+
+def _apply_stop_filter(boxes: list[Box], min_stop_pct: float) -> tuple[list[Box], list[Box]]:
+    """손절폭(|EP-SL|/EP)이 min_stop_pct 미만인 타점을 걸러낸다.
+
+    좁은 박스는 노이즈에 손절당하기 쉬운 데다, 리스크 기반 사이징 특성상
+    명목 규모가 커져 수수료가 리스크 대비 과도하게 붙는다.
+    """
+    if min_stop_pct <= 0:
+        return list(boxes), []
+    kept: list[Box] = []
+    rejected: list[Box] = []
+    for box in boxes:
+        stop_pct = abs(box.ep - box.sl) / box.ep * 100
+        if stop_pct < min_stop_pct:
+            box.status = "canceled"
+            box.skip_reason = "stop_too_tight"
+            rejected.append(box)
+        else:
+            kept.append(box)
+    return kept, rejected
+
+
+def _resolve_pnl_and_roi(
+    box: Box,
+    is_win: bool,
+    rr_ratio: float,
+    costs: CostModel = CostModel(),
+) -> float:
+    """실현 손익 계산. 수수료/슬리피지는 명목 규모(position_size)에 비례해 차감한다."""
     pnl = (box.risk_amount * rr_ratio) if is_win else -box.risk_amount
+    notional = box.position_size or 0.0
+    exit_fee = costs.exit_fee_win_pct if is_win else costs.exit_fee_loss_pct
+    pnl -= notional * (costs.entry_fee_pct + exit_fee) / 100
+    pnl -= notional * (costs.entry_slippage_pct + costs.exit_slippage_pct) / 100
     if is_win:
         box.asset_roi_percent = (
             ((box.tp - box.ep) / box.ep) * 100
@@ -61,6 +131,10 @@ def run_backtest(
     risk_per_trade: float,
     leverage: float,
     max_positions: int,
+    min_stop_pct: float = 0.0,
+    costs: CostModel = CostModel(),
+    max_same_direction: int | None = None,
+    intrabar: str = "loss",
 ) -> BacktestResult:
     engine = ChartEngine()
     detected_boxes = engine.process(candles, interval, rr_ratio)
@@ -73,8 +147,8 @@ def run_backtest(
     max_drawdown = 0.0
 
     open_positions: list[Box] = []
-    pending_boxes: list[Box] = list(detected_boxes)
-    final_boxes: list[Box] = []
+    pending_boxes, rejected_boxes = _apply_stop_filter(detected_boxes, min_stop_pct)
+    final_boxes: list[Box] = list(rejected_boxes)
 
     curve: list[EquityPoint] = []
 
@@ -97,7 +171,7 @@ def run_backtest(
                     is_resolved, is_win = True, True
 
             if is_resolved:
-                pnl = _resolve_pnl_and_roi(pos, is_win, rr_ratio)
+                pnl = _resolve_pnl_and_roi(pos, is_win, rr_ratio, costs)
                 current_equity += pnl
                 available_margin += pos.margin_used + pnl
                 total_r += rr_ratio if is_win else -1
@@ -114,6 +188,14 @@ def run_backtest(
         for i in range(len(pending_boxes) - 1, -1, -1):
             box = pending_boxes[i]
             if c.open_time < box.created_at:
+                continue
+
+            # 롱은 sl < ep, 숏은 sl > ep 이므로 SL을 찍은 캔들은 반드시 EP도 찍은
+            # 캔들이다. 즉 이 분기는 "EP와 SL이 한 캔들 안에서 모두 닿은" 경우이며,
+            # 5초 폴링으로 EP 터치 즉시 시장가 진입하는 실봇에서는 진입 후 손절로
+            # 끝난다. intrabar="loss"(기본)는 이를 패배로 계상하고,
+            # "skip"은 거래 자체가 없었던 것으로 보는 기존(낙관적) 동작이다.
+            if intrabar != "skip":
                 continue
 
             hit_sl_before_entry = (box.direction == "long" and c.low <= box.sl) or (
@@ -141,6 +223,17 @@ def run_backtest(
             if len(open_positions) >= max_positions:
                 box.status = "canceled"
                 box.skip_reason = "max_positions"
+                box.resolved_at = c.open_time
+                final_boxes.append(box)
+                pending_boxes.pop(i)
+                continue
+
+            if max_same_direction is not None and (
+                sum(1 for p in open_positions if p.direction == box.direction)
+                >= max_same_direction
+            ):
+                box.status = "canceled"
+                box.skip_reason = "same_direction_cap"
                 box.resolved_at = c.open_time
                 final_boxes.append(box)
                 pending_boxes.pop(i)
@@ -188,7 +281,7 @@ def run_backtest(
                     is_resolved_now, is_win_now = True, True
 
             if is_resolved_now:
-                pnl = _resolve_pnl_and_roi(box, is_win_now, rr_ratio)
+                pnl = _resolve_pnl_and_roi(box, is_win_now, rr_ratio, costs)
                 current_equity += pnl
                 available_margin += box.margin_used + pnl
                 total_r += rr_ratio if is_win_now else -1
@@ -236,6 +329,10 @@ def run_multi_symbol_backtest(
     risk_per_trade: float,
     leverage: float,
     max_positions: int,
+    min_stop_pct: float = 0.0,
+    costs: CostModel = CostModel(),
+    max_same_direction: int | None = None,
+    intrabar: str = "loss",
 ) -> BacktestResult:
     """여러 심볼이 하나의 공유 자본/증거금 풀을 놓고 경쟁하는 백테스트.
 
@@ -256,6 +353,8 @@ def run_multi_symbol_backtest(
             box.id = f"{symbol}:{box.id}"  # 심볼 간 id 충돌(같은 open_time) 방지
         pending_boxes.extend(detected)
 
+    pending_boxes, rejected_boxes = _apply_stop_filter(pending_boxes, min_stop_pct)
+
     all_times = sorted(set().union(*(ct.keys() for ct in candles_by_time.values())))
 
     current_equity = initial_capital
@@ -265,7 +364,7 @@ def run_multi_symbol_backtest(
     max_drawdown = 0.0
 
     open_positions: list[Box] = []
-    final_boxes: list[Box] = []
+    final_boxes: list[Box] = list(rejected_boxes)
     curve: list[EquityPoint] = []
 
     for t in all_times:
@@ -288,7 +387,7 @@ def run_multi_symbol_backtest(
                     is_resolved, is_win = True, True
 
             if is_resolved:
-                pnl = _resolve_pnl_and_roi(pos, is_win, rr_ratio)
+                pnl = _resolve_pnl_and_roi(pos, is_win, rr_ratio, costs)
                 current_equity += pnl
                 available_margin += pos.margin_used + pnl
                 total_r += rr_ratio if is_win else -1
@@ -304,6 +403,14 @@ def run_multi_symbol_backtest(
             c = candles_by_time[box.symbol].get(t)
             if c is None or t < box.created_at:
                 continue
+            # 롱은 sl < ep, 숏은 sl > ep 이므로 SL을 찍은 캔들은 반드시 EP도 찍은
+            # 캔들이다. 즉 이 분기는 "EP와 SL이 한 캔들 안에서 모두 닿은" 경우이며,
+            # 5초 폴링으로 EP 터치 즉시 시장가 진입하는 실봇에서는 진입 후 손절로
+            # 끝난다. intrabar="loss"(기본)는 이를 패배로 계상하고,
+            # "skip"은 거래 자체가 없었던 것으로 보는 기존(낙관적) 동작이다.
+            if intrabar != "skip":
+                continue
+
             hit_sl_before_entry = (box.direction == "long" and c.low <= box.sl) or (
                 box.direction == "short" and c.high >= box.sl
             )
@@ -329,6 +436,17 @@ def run_multi_symbol_backtest(
             if len(open_positions) >= max_positions:
                 box.status = "canceled"
                 box.skip_reason = "max_positions"
+                box.resolved_at = c.open_time
+                final_boxes.append(box)
+                pending_boxes.pop(i)
+                continue
+
+            if max_same_direction is not None and (
+                sum(1 for p in open_positions if p.direction == box.direction)
+                >= max_same_direction
+            ):
+                box.status = "canceled"
+                box.skip_reason = "same_direction_cap"
                 box.resolved_at = c.open_time
                 final_boxes.append(box)
                 pending_boxes.pop(i)
@@ -375,7 +493,7 @@ def run_multi_symbol_backtest(
                     is_resolved_now, is_win_now = True, True
 
             if is_resolved_now:
-                pnl = _resolve_pnl_and_roi(box, is_win_now, rr_ratio)
+                pnl = _resolve_pnl_and_roi(box, is_win_now, rr_ratio, costs)
                 current_equity += pnl
                 available_margin += box.margin_used + pnl
                 total_r += rr_ratio if is_win_now else -1
@@ -442,15 +560,67 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--leverage", type=float, default=config.TRADING_OPTIONS.leverage)
     parser.add_argument("--max-positions", type=int, default=config.TRADING_OPTIONS.max_positions)
     parser.add_argument("--rr", type=float, default=config.TRADING_OPTIONS.rr_ratio, help="손익비 (Risk-Reward)")
+    parser.add_argument(
+        "--min-stop-pct",
+        type=float,
+        default=0.0,
+        help="최소 손절폭 필터(%%). 손절폭이 이 값보다 좁은 타점은 진입하지 않는다 (0=필터 없음)",
+    )
+    parser.add_argument(
+        "--entry-mode",
+        choices=("taker", "maker"),
+        default="taker",
+        help="taker=현행 시장가 진입/청산, maker=지정가 진입 + TP 지정가 청산 (SL은 시장가 유지)",
+    )
+    parser.add_argument(
+        "--fee-rate",
+        type=float,
+        default=0.0,
+        help="테이커 편도 수수료율(%%). entry-mode=maker면 손절 청산에만 적용된다",
+    )
+    parser.add_argument(
+        "--maker-fee-rate",
+        type=float,
+        default=0.02,
+        help="메이커 편도 수수료율(%%). entry-mode=maker일 때 진입/TP청산에 적용",
+    )
+    parser.add_argument(
+        "--slippage-pct",
+        type=float,
+        default=0.0,
+        help="편도 슬리피지(%%). 진입/청산 각각 불리하게 체결된다고 가정한다",
+    )
+    parser.add_argument(
+        "--intrabar",
+        choices=("loss", "skip"),
+        default="loss",
+        help="한 캔들 안에서 EP와 SL이 모두 닿았을 때의 처리. loss=진입 후 손절로 계상(기본, 실봇 동작에 가까움), skip=거래 없음으로 처리(기존 낙관적 동작)",
+    )
+    parser.add_argument(
+        "--max-same-direction",
+        type=int,
+        default=None,
+        help="같은 방향(롱/숏)으로 동시에 보유할 최대 포지션 수. 상관 심볼 동시 진입을 막는다",
+    )
     return parser.parse_args()
 
 
+def _build_costs(args: argparse.Namespace) -> CostModel:
+    if args.entry_mode == "maker":
+        return CostModel.maker_entry(args.maker_fee_rate, args.fee_rate, args.slippage_pct)
+    return CostModel.taker(args.fee_rate, args.slippage_pct)
+
+
 def _print_result(result: BacktestResult, capital: float) -> None:
+    net = result.final_equity - capital
     print("=========================")
-    print(f"최종 자산: ${result.final_equity:,.2f} (시작: ${capital:,.2f})")
+    print(f"최종 자산: ${result.final_equity:,.2f} (시작: ${capital:,.2f}, 순손익 {net:+,.2f} / {net / capital * 100:+.2f}%)")
     print(f"승률: {result.win_rate:.2f}% ({result.wins}/{result.total})")
     print(f"MDD: {result.mdd:.2f}%")
     print(f"감지된 타점 수: {len(result.boxes)}개")
+    skipped = Counter(b.skip_reason for b in result.boxes if b.skip_reason)
+    if skipped:
+        print("스킵 사유: " + ", ".join(f"{k} {v}건" for k, v in skipped.most_common()))
     print("=========================")
 
 
@@ -484,6 +654,10 @@ def main() -> None:
             args.risk,
             args.leverage,
             args.max_positions,
+            min_stop_pct=args.min_stop_pct,
+            costs=_build_costs(args),
+            max_same_direction=args.max_same_direction,
+            intrabar=args.intrabar,
         )
         _print_result(result, args.capital)
         return
@@ -497,6 +671,10 @@ def main() -> None:
         args.risk,
         args.leverage,
         args.max_positions,
+        min_stop_pct=args.min_stop_pct,
+        costs=_build_costs(args),
+        max_same_direction=args.max_same_direction,
+        intrabar=args.intrabar,
     )
     _print_result(result, args.capital)
 
@@ -506,7 +684,11 @@ def main() -> None:
         closed = [b for b in symbol_boxes if b.status in ("reacted", "invalidated")]
         wins = sum(1 for b in closed if b.status == "reacted")
         win_rate = (wins / len(closed) * 100) if closed else 0.0
-        print(f"  {symbol}: 거래 {wins}/{len(closed)} (승률 {win_rate:.2f}%), 감지 타점 {len(symbol_boxes)}개")
+        pnl = sum(b.realized_pnl or 0.0 for b in closed)
+        print(
+            f"  {symbol}: 거래 {wins}/{len(closed)} (승률 {win_rate:.2f}%), "
+            f"순손익 {pnl:+,.2f}, 감지 타점 {len(symbol_boxes)}개"
+        )
     print("=========================")
 
 
