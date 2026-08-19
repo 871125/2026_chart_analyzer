@@ -29,6 +29,10 @@ STATE_FILE = Path(__file__).resolve().parent / "state.json"
 # 익절도 TP 지정가로 처리한다(손절만 시장가). "taker"는 EP 터치 시 시장가 진입.
 # config.TRADING_OPTIONS.entry_mode로 덮어쓸 수 있다.
 ENTRY_MODE: str = getattr(config.TRADING_OPTIONS, "entry_mode", "maker")
+# 박스가 이보다 좁으면(|EP-SL|/EP) 타점을 버린다. 0 이면 필터 없음.
+MIN_STOP_PCT: float = getattr(config.TRADING_OPTIONS, "min_stop_pct", 0.7)
+# 타점 생성 후 이 봉수 안에 EP를 만나지 못하면 폐기한다. 0 이면 만료 없음.
+MAX_PENDING_CANDLES: int = getattr(config.TRADING_OPTIONS, "max_pending_candles", 30)
 
 pending_boxes: list[Box] = []
 active_positions: list[Box] = []
@@ -155,6 +159,7 @@ def check_market() -> None:
         latest_candles: dict[str, Candle] = {}
         latest_prices: dict[str, float] = {}
         new_pending_boxes: list[Box] = []
+        skipped_tight: list[Box] = []
 
         for symbol in config.TRADING_OPTIONS.binance_symbols:
             candles, is_mock = BinanceAPI.fetch_klines(
@@ -191,7 +196,12 @@ def check_market() -> None:
                             return False
                     return True
 
-                new_pending_boxes.extend([b for b in detected_boxes if _is_new(b)][-5:])
+                fresh = [b for b in detected_boxes if _is_new(b)][-5:]
+                for b in fresh:
+                    if _is_stop_too_tight(b):
+                        skipped_tight.append(b)
+                    else:
+                        new_pending_boxes.append(b)
 
         if not latest_candles:
             return
@@ -218,6 +228,15 @@ def check_market() -> None:
                     f"(현재 대기 중인 타점 유지: {len(pending_boxes)}개)\n=========================\n"
                 )
 
+            if skipped_tight:
+                alert_msg += f"[손절폭 필터] {len(skipped_tight)}개 타점 제외 (최소 {MIN_STOP_PCT}%)\n"
+                for box in skipped_tight:
+                    alert_msg += (
+                        f" - {box.symbol} {box.direction.upper()} "
+                        f"EP {box.ep:.2f} / 손절폭 {_stop_width_pct(box):.2f}%\n"
+                    )
+                alert_msg += "=========================\n"
+
             send_telegram_message(alert_msg)
             last_calculated_period = current_period
             state_changed = True
@@ -229,6 +248,33 @@ def check_market() -> None:
             save_state()
     except Exception as error:
         print(f"[에러] Market check error: {error}")
+
+
+def _stop_width_pct(box: Box) -> float:
+    return abs(box.ep - box.sl) / box.ep * 100
+
+
+def _is_stop_too_tight(box: Box) -> bool:
+    """손절폭이 좁은 타점인지 판정.
+
+    좁은 박스는 노이즈에 손절당하기 쉬운 데다, 리스크 기반 사이징 때문에 명목
+    규모가 커져 수수료가 리스크 대비 과도해진다 (백테스트 2년 기준 손절폭 0.7%
+    미만 구간만 기대값이 음수였다).
+    """
+    return MIN_STOP_PCT > 0 and _stop_width_pct(box) < MIN_STOP_PCT
+
+
+def _is_expired(box: Box, now_ms: float) -> bool:
+    """생성 후 EP를 만나지 못한 채 너무 오래 대기한 타점인지 판정.
+
+    백테스트 2년 기준 25~35봉 구간에서 거래당 기대값이 가장 높았고(전후반기 모두),
+    그보다 오래 묵은 타점은 승률/기대값이 함께 낮아진다. 지정가(메이커) 모드에서는 만료되지 않은
+    타점이 증거금과 max_positions 슬롯까지 계속 점유하므로 더 중요하다.
+    """
+    if not MAX_PENDING_CANDLES:
+        return False
+    interval_ms = _get_interval_seconds(config.TRADING_OPTIONS.interval) * 1000
+    return (now_ms - box.created_at) > MAX_PENDING_CANDLES * interval_ms
 
 
 def _retire_box(box: Box, index: int) -> None:
@@ -347,6 +393,7 @@ def _process_pending_boxes_maker(
     """
     global pending_boxes, active_positions, open_positions
     state_changed = False
+    now_ms = time.time() * 1000
 
     for i in range(len(pending_boxes) - 1, -1, -1):
         box = pending_boxes[i]
@@ -358,6 +405,32 @@ def _process_pending_boxes_maker(
         hit_sl_before_entry = (box.direction == "long" and current_candle.low <= box.sl) or (
             box.direction == "short" and current_candle.high >= box.sl
         )
+
+        # 0. 오래 대기한 타점은 폐기한다. 걸어둔 지정가 주문이 있으면 함께 취소한다.
+        #    (부분 체결분이 있으면 이미 포지션이므로 만료시키지 않고 SL/TP에 맡긴다)
+        if _is_expired(box, now_ms):
+            filled_qty = 0.0
+            if box.entry_order_id is not None:
+                try:
+                    order = binance_client.get_order(box.symbol, box.entry_order_id)
+                    filled_qty = float(order.get("executedQty") or 0)
+                except Exception as api_err:
+                    print(f"[만료 처리 중 주문 조회 실패] [{box.symbol}] {api_err}")
+                    continue
+            if filled_qty <= 0:
+                if box.entry_order_id is not None:
+                    try:
+                        binance_client.cancel_order(box.symbol, box.entry_order_id)
+                    except Exception as cancel_err:
+                        print(f"[만료 주문 취소 실패] [{box.symbol}] {cancel_err}")
+                    box.entry_order_id = None
+                send_telegram_message(
+                    f"[타점 만료] [{box.symbol}] {box.direction.upper()} "
+                    f"EP {box.ep:.2f}에 {MAX_PENDING_CANDLES}봉 동안 도달하지 못해 폐기합니다."
+                )
+                _retire_box(box, i)
+                state_changed = True
+                continue
 
         # 1. 이미 EP에 주문을 걸어둔 타점 -> 체결 여부 확인
         if box.entry_order_id is not None:
@@ -495,6 +568,7 @@ def _process_pending_boxes_taker(
     """기존 방식: EP 터치를 감지하면 시장가로 즉시 진입한다."""
     global pending_boxes, active_positions, open_positions
     state_changed = False
+    now_ms = time.time() * 1000
 
     for i in range(len(pending_boxes) - 1, -1, -1):
         box = pending_boxes[i]
@@ -506,6 +580,15 @@ def _process_pending_boxes_taker(
         hit_sl_before_entry = (box.direction == "long" and current_candle.low <= box.sl) or (
             box.direction == "short" and current_candle.high >= box.sl
         )
+        if _is_expired(box, now_ms):
+            send_telegram_message(
+                f"[타점 만료] [{box.symbol}] {box.direction.upper()} "
+                f"EP {box.ep:.2f}에 {MAX_PENDING_CANDLES}봉 동안 도달하지 못해 폐기합니다."
+            )
+            _retire_box(box, i)
+            state_changed = True
+            continue
+
         if hit_sl_before_entry:
             send_telegram_message(
                 f"[타점 취소] [{box.symbol}] EP 도달 전 SL 먼저 터치됨. 대상 타점: {box.ep:.2f}"

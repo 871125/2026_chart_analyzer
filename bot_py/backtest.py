@@ -75,6 +75,14 @@ class CostModel:
         )
 
 
+def _interval_to_ms(interval: str) -> int:
+    """'4h' 같은 주기 문자열을 밀리초로 바꾼다."""
+    unit = interval[-1]
+    value = int(interval[:-1])
+    factor = {"m": 60, "h": 60 * 60, "d": 24 * 60 * 60, "w": 7 * 24 * 60 * 60}.get(unit, 15 * 60)
+    return value * factor * 1000
+
+
 def _apply_stop_filter(boxes: list[Box], min_stop_pct: float) -> tuple[list[Box], list[Box]]:
     """손절폭(|EP-SL|/EP)이 min_stop_pct 미만인 타점을 걸러낸다.
 
@@ -132,10 +140,12 @@ def run_backtest(
     leverage: float,
     max_positions: int,
     min_stop_pct: float = 0.0,
+    max_pending_candles: int = 0,
     costs: CostModel = CostModel(),
     max_same_direction: int | None = None,
     intrabar: str = "loss",
 ) -> BacktestResult:
+    interval_ms = _interval_to_ms(interval)
     engine = ChartEngine()
     detected_boxes = engine.process(candles, interval, rr_ratio)
 
@@ -183,6 +193,18 @@ def run_backtest(
 
                 final_boxes.append(pos)
                 open_positions.pop(i)
+
+        # 2-0. 생성 후 오래 대기한 박스는 폐기한다. 백테스트상 20봉 이내에 진입한
+        # 타점이 수익의 대부분을 만들고, 오래 묵은 타점은 승률/기대값이 모두 낮다.
+        if max_pending_candles:
+            for i in range(len(pending_boxes) - 1, -1, -1):
+                box = pending_boxes[i]
+                if c.open_time - box.created_at > max_pending_candles * interval_ms:
+                    box.status = "canceled"
+                    box.skip_reason = "expired"
+                    box.resolved_at = c.open_time
+                    final_boxes.append(box)
+                    pending_boxes.pop(i)
 
         # 2. 대기 중인 박스 중 EP 도달 전 SL을 먼저 터치한 경우 취소
         for i in range(len(pending_boxes) - 1, -1, -1):
@@ -330,6 +352,7 @@ def run_multi_symbol_backtest(
     leverage: float,
     max_positions: int,
     min_stop_pct: float = 0.0,
+    max_pending_candles: int = 0,
     costs: CostModel = CostModel(),
     max_same_direction: int | None = None,
     intrabar: str = "loss",
@@ -341,6 +364,7 @@ def run_multi_symbol_backtest(
     증거금 한도 내에서 진입한다. max_positions도 심볼 구분 없이 전체 기준으로
     공유된다.
     """
+    interval_ms = _interval_to_ms(interval)
     candles_by_time: dict[str, dict[int, Candle]] = {}
     pending_boxes: list[Box] = []
 
@@ -397,6 +421,16 @@ def run_multi_symbol_backtest(
                 pos.realized_pnl_percent = (pnl / (current_equity - pnl)) * 100
                 final_boxes.append(pos)
                 open_positions.pop(i)
+
+        if max_pending_candles:
+            for i in range(len(pending_boxes) - 1, -1, -1):
+                box = pending_boxes[i]
+                if t - box.created_at > max_pending_candles * interval_ms:
+                    box.status = "canceled"
+                    box.skip_reason = "expired"
+                    box.resolved_at = t
+                    final_boxes.append(box)
+                    pending_boxes.pop(i)
 
         for i in range(len(pending_boxes) - 1, -1, -1):
             box = pending_boxes[i]
@@ -567,6 +601,12 @@ def _parse_args() -> argparse.Namespace:
         help="최소 손절폭 필터(%%). 손절폭이 이 값보다 좁은 타점은 진입하지 않는다 (0=필터 없음)",
     )
     parser.add_argument(
+        "--max-pending-candles",
+        type=int,
+        default=0,
+        help="타점 생성 후 이 봉수 안에 EP를 못 만나면 폐기한다 (0=만료 없음)",
+    )
+    parser.add_argument(
         "--entry-mode",
         choices=("taker", "maker"),
         default="taker",
@@ -655,6 +695,7 @@ def main() -> None:
             args.leverage,
             args.max_positions,
             min_stop_pct=args.min_stop_pct,
+            max_pending_candles=args.max_pending_candles,
             costs=_build_costs(args),
             max_same_direction=args.max_same_direction,
             intrabar=args.intrabar,
@@ -672,6 +713,7 @@ def main() -> None:
         args.leverage,
         args.max_positions,
         min_stop_pct=args.min_stop_pct,
+        max_pending_candles=args.max_pending_candles,
         costs=_build_costs(args),
         max_same_direction=args.max_same_direction,
         intrabar=args.intrabar,

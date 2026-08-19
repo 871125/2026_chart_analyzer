@@ -76,6 +76,7 @@ class Box:
             "sl_before_ep",
             "stop_too_tight",
             "same_direction_cap",
+            "expired",
         ]
     ] = None
     quantity: Optional[float] = None
