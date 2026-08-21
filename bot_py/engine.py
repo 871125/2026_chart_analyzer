@@ -77,6 +77,7 @@ class Box:
             "stop_too_tight",
             "same_direction_cap",
             "expired",
+            "no_resting_order",
         ]
     ] = None
     quantity: Optional[float] = None

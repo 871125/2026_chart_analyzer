@@ -353,6 +353,7 @@ def run_multi_symbol_backtest(
     max_positions: int,
     min_stop_pct: float = 0.0,
     max_pending_candles: int = 0,
+    reserve_slots: bool = False,
     costs: CostModel = CostModel(),
     max_same_direction: int | None = None,
     intrabar: str = "loss",
@@ -388,6 +389,9 @@ def run_multi_symbol_backtest(
     max_drawdown = 0.0
 
     open_positions: list[Box] = []
+    # reserve_slots=True면 실봇의 지정가 모드처럼, EP에 주문을 걸어둔 타점도
+    # max_positions 슬롯을 차지한다 (거래소가 미체결 주문에도 증거금을 묶기 때문).
+    armed_ids: set[str] = set()
     final_boxes: list[Box] = list(rejected_boxes)
     curve: list[EquityPoint] = []
 
@@ -429,8 +433,18 @@ def run_multi_symbol_backtest(
                     box.status = "canceled"
                     box.skip_reason = "expired"
                     box.resolved_at = t
+                    armed_ids.discard(box.id)
                     final_boxes.append(box)
                     pending_boxes.pop(i)
+
+        if reserve_slots:
+            # 자리가 남는 만큼 EP에 주문을 걸어둔다. 실봇(_process_pending_boxes_maker)이
+            # 대기 목록을 뒤에서부터 훑으므로 여기서도 신규 타점부터 주문을 건다.
+            for box in reversed(pending_boxes):
+                if len(open_positions) + len(armed_ids) >= max_positions:
+                    break
+                if box.id not in armed_ids and t >= box.created_at:
+                    armed_ids.add(box.id)
 
         for i in range(len(pending_boxes) - 1, -1, -1):
             box = pending_boxes[i]
@@ -465,6 +479,15 @@ def run_multi_symbol_backtest(
                 box.direction == "short" and c.high >= box.ep
             )
             if not is_hit_ep:
+                continue
+
+            if reserve_slots and box.id not in armed_ids:
+                # 주문을 걸어두지 못한 타점은 EP가 와도 체결될 수 없다.
+                box.status = "canceled"
+                box.skip_reason = "no_resting_order"
+                box.resolved_at = c.open_time
+                final_boxes.append(box)
+                pending_boxes.pop(i)
                 continue
 
             if len(open_positions) >= max_positions:
@@ -510,6 +533,7 @@ def run_multi_symbol_backtest(
             box.risk_amount = actual_risk
 
             available_margin -= actual_margin
+            armed_ids.discard(box.id)
             open_positions.append(box)
             pending_boxes.pop(i)
 
@@ -599,6 +623,13 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="최소 손절폭 필터(%%). 손절폭이 이 값보다 좁은 타점은 진입하지 않는다 (0=필터 없음)",
+    )
+    parser.add_argument(
+        "--reserve-slots",
+        choices=("on", "off"),
+        default="on",
+        help="on이면 EP에 걸어둔 지정가 주문도 max-positions 슬롯을 차지한다 "
+        "(실봇의 지정가 모드와 동일). 멀티 심볼 모드에서만 적용된다",
     )
     parser.add_argument(
         "--max-pending-candles",
@@ -714,6 +745,7 @@ def main() -> None:
         args.max_positions,
         min_stop_pct=args.min_stop_pct,
         max_pending_candles=args.max_pending_candles,
+        reserve_slots=args.reserve_slots == "on",
         costs=_build_costs(args),
         max_same_direction=args.max_same_direction,
         intrabar=args.intrabar,
