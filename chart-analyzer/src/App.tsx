@@ -262,7 +262,7 @@ class SidewaysBoxDetector {
             if (bIndex - i < 1) continue;
             if (!this.validatePreBreakReentry(candles, i, bIndex, direction)) continue;
 
-            const archetype = this.determineArchetype(candles, i, bIndex, bIndex - i, interval, direction);
+            const archetype = this.determineArchetype(candles, i, bIndex, bIndex - i, interval);
             if (archetype === 'unknown') continue;
 
             const score = this.calculateScore(candles, rsi, bIndex, archetype, direction);
@@ -319,7 +319,7 @@ class SidewaysBoxDetector {
     // }
 
 
-    private determineArchetype(candles: Candle[], startIdx: number, bIdx: number, len: number, interval: CandleInterval, dir: 'long'|'short'): Box['archetype'] {
+    private determineArchetype(candles: Candle[], startIdx: number, bIdx: number, len: number, interval: CandleInterval): Box['archetype'] {
         const c1 = candles[bIdx - 2]; const c2 = candles[bIdx - 1];
         
         if (len >= 10 && Indicators.hasVolumeExpansion(candles, bIdx - 1)) {
